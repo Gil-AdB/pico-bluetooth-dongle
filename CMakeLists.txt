@@ -43,8 +43,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE .)
 # 7. Link all necessary libraries to your executable.
 target_link_libraries(${PROJECT_NAME}
 		pico_async_context_base
-		pico_lwip
-		pico_lwip_nosys
 		pico_btstack_base
 		pico_btstack_cyw43
 		pico_btstack_ble
@@ -63,6 +61,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 		TUSB_CONFIG_FILE="tusb_config.h"
 		PICO_CYW43_SUPPORTED
 		ENABLE_BLE=1
+		CYW43_LWIP=0
 )
 
 # 9. Ensure the final .uf2 file is generated for flashing.
