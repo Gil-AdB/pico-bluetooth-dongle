@@ -1,0 +1,8 @@
+# Build artifacts
+/build/
+
+# macOS specific files
+.DS_Store
+
+# IDE specific files
+.idea/
