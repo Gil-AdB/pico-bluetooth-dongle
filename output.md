@@ -1,17 +1,14 @@
-Excellent! The project has been rebuilt successfully as a composite device with both Bluetooth HCI (BTH) and a serial (CDC) interface for debugging.
+Great! The project has been rebuilt successfully as a dedicated Bluetooth HCI (BTH) device. The composite device configuration has been removed to simplify the USB descriptors, as it might have been the source of the "invalid parameter" error.
 
 Now, please flash the newly generated `.uf2` file (from the `build` directory) to your Pico W on the Windows machine. After flashing:
 
-1.  **Check for the COM port:**
-    *   Connect the Pico W to your Windows machine.
-    *   Open 'Device Manager' and look under 'Ports (COM & LPT)'. You should now see a new COM port appear (e.g., 'USB Serial Device (COMx)'). If you see this, it's a great sign that the USB composite device is enumerating correctly.
+1.  **Check the device status in Device Manager:**
+    *   See if the device still appears as a "Generic Bluetooth Adapter".
+    *   Check if the error is still "Code 10, An invalid parameter was passed to a service or function".
 
-2.  **View `printf` output:**
-    *   Connect to the new COM port with a serial terminal (e.g., PuTTY, RealTerm, Windows Terminal) configured to **115200 baud**.
-    *   Observe if you see the "Pico W Bluetooth Dongle started." message and any subsequent HCI activity logs.
+2.  **Next Steps for Debugging:**
+    *   Since we have removed the CDC (serial) interface to simplify the device, `printf` output over USB will not be available with this build.
+    *   If the "Code 10" error persists, we have likely isolated the problem to the BTH interface itself or the initial HCI communication, not the composite device configuration.
+    *   As you mentioned, the next logical step would be to use a **logic analyzer** to capture the USB D+/D- lines, or a **TTL adapter** to get serial output directly from the Pico W's UART pins. This will give us a much clearer view of the data being exchanged between the host and the device, and any potential errors in the HCI commands or responses.
 
-3.  **Check the Bluetooth device status:**
-    *   Even if the Bluetooth device still shows a "Code 10" error, check if the error message has changed.
-    *   The `printf` output from the serial terminal is now the most crucial piece of information. Please provide any output you see, especially if it logs any incoming HCI commands from the host. This will tell us how far the driver initialization gets before it fails.
-
-This new build should provide us with the debugging information we need to solve the "Code 10" error.
+Let me know if the device behavior changes with this new build. If not, the external debugging tools will be essential to solve this issue.

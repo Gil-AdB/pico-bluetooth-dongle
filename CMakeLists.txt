@@ -62,7 +62,8 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 		PICO_CYW43_SUPPORTED
 		ENABLE_BLE=1
 		CYW43_LWIP=0
-		PICO_STDIO_USB=1
+		PICO_STDIO_USB=0
+		PICO_STDIO_UART=1
 )
 
 # 9. Ensure the final .uf2 file is generated for flashing.
