@@ -27,6 +27,14 @@
      // Set Isochronous (audio) endpoint support to 0, as we are not using it.
 #define CFG_TUD_BTH_ISO_ALT_COUNT   0
 
+     //--------------------------------------------------------------------
+     // CDC CLASS DRIVER CONFIGURATION
+     //--------------------------------------------------------------------
+#define CFG_TUD_CDC                 1
+
+#define CFG_TUD_CDC_RX_BUFSIZE      64
+#define CFG_TUD_CDC_TX_BUFSIZE      64
+
 #ifdef __cplusplus
  }
 #endif

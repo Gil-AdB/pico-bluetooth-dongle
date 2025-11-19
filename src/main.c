@@ -17,6 +17,7 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, 
 
 int main() {
     board_init();
+    printf("Pico W Bluetooth Dongle started.\n");
 
     if (cyw43_arch_init()) {
         // Initialization failed, blink LED rapidly
@@ -56,14 +57,18 @@ int main() {
 
 // UPSTREAM: CYW43 -> Pico -> Host PC
 void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
-    // tud_bt_hci_ready() check removed as function does not exist
-
+    printf("HCI_PACKET_HANDLER: type=0x%02x, channel=0x%04x, size=%u\n", packet_type, channel, size);
     switch (packet_type) {
         case 0x04: // HCI Event
             tud_bt_event_send(packet, size);
+            printf("  -> Sent HCI Event to USB Host.\n");
             break;
         case 0x02: // HCI ACL Data
             tud_bt_acl_data_send(packet, size);
+            printf("  -> Sent HCI ACL Data to USB Host.\n");
+            break;
+        default:
+            printf("  -> Unhandled HCI Packet Type to USB Host: 0x%02x\n", packet_type);
             break;
     }
     return;
@@ -76,11 +81,15 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, 
 // They will then forward these to the BTstack HCI transport.
 
 void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
+    printf("TUD_BT_HCI_CMD_CB: len=%u\n", cmd_len);
     hci_transport_cyw43_instance()->send_packet(HCI_COMMAND_DATA_PACKET, (uint8_t*)hci_cmd, cmd_len);
+    printf("  -> Forwarded HCI Command to CYW43.\n");
 }
 
 void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
+    printf("TUD_BT_ACL_DATA_RECEIVED_CB: len=%u\n", data_len);
     hci_transport_cyw43_instance()->send_packet(HCI_ACL_DATA_PACKET, (uint8_t*)acl_data, data_len);
+    printf("  -> Forwarded HCI ACL Data to CYW43.\n");
 }
 
 // --- USB Descriptors ---
@@ -105,14 +114,28 @@ tusb_desc_device_t const desc_device = {
     .bNumConfigurations = 0x01
 };
 
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_BTH_DESC_LEN)
+enum {
+    ITF_NUM_BTH = 0,
+    ITF_NUM_BTH_DATA,
+    ITF_NUM_CDC,
+    ITF_NUM_CDC_DATA,
+    ITF_NUM_TOTAL
+};
+
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_BTH_DESC_LEN + TUD_CDC_DESC_LEN)
+
 #define EPNUM_BT_EVT      0x81
 #define EPNUM_BT_ACL_OUT  0x02
 #define EPNUM_BT_ACL_IN   0x82
 
+#define EPNUM_CDC_NOTIF 0x83
+#define EPNUM_CDC_OUT   0x04
+#define EPNUM_CDC_IN    0x84
+
 uint8_t const desc_configuration[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
-    TUD_BTH_DESCRIPTOR(0, 0, EPNUM_BT_EVT, 16, 0x01, EPNUM_BT_ACL_OUT, EPNUM_BT_ACL_IN, 64, 0, 0)
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, 0, EPNUM_BT_EVT, 16, 0x01, EPNUM_BT_ACL_OUT, EPNUM_BT_ACL_IN, 64, 0, 0),
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 0, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64)
 };
 
 char const* string_desc_arr[] = {
