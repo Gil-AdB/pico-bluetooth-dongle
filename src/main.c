@@ -28,6 +28,16 @@ enum {
 static volatile int led_state = LED_STATE_IDLE;
 
 // --- CDC Logging ---
+#include "log_buffer.h"
+
+// Output function for log dump to CDC
+void cdc_output(const char *str, int len) {
+  if (tud_cdc_connected()) {
+    tud_cdc_write(str, len);
+    tud_cdc_write_flush();
+  }
+}
+
 int cdc_printf(const char *format, ...) {
   char buf[256];
   va_list args;
@@ -36,23 +46,18 @@ int cdc_printf(const char *format, ...) {
   va_end(args);
 
   if (len > 0) {
-    // Filter out logs related to the CDC IN endpoint (EP 82) to prevent
-    // infinite loops (Logging triggers a transfer, which triggers a log, etc.)
-    // Aggressive filter: Ignore anything with "CDC" or the CDC endpoint numbers
-    // Also filter "USBD Xfer Complete" because it is printed in a separate call
-    // before the endpoint number
-    if (strstr(buf, "CDC") != NULL || strstr(buf, "EP 82") != NULL ||
-        strstr(buf, "EP 81") != NULL || strstr(buf, "EP 02") != NULL ||
-        strstr(buf, "USBD Xfer Complete") != NULL) {
+    // Store in log buffer
+    log_buffer_append(buf, len);
+
+    // Filter out TinyUSB internal logs to prevent infinite loops
+    if ((buf[0] == ' ' && buf[1] == ' ') ||
+        strstr(buf, "USBD Xfer Complete") != NULL ||
+        strstr(buf, "USBD Setup") != NULL) {
       return len;
     }
 
-    // Write to CDC interface 0
-    // Check if connected first to avoid blocking or filling buffer if no host
-    if (tud_cdc_connected()) {
-      tud_cdc_write(buf, len);
-      tud_cdc_write_flush();
-    }
+    // Write to CDC if connected
+    cdc_output(buf, len);
   }
   return len;
 }
@@ -101,6 +106,9 @@ int main() {
   // turn on bluetooth!
   hci_power_control(HCI_POWER_ON);
 
+  // Initialize log buffer
+  log_buffer_init();
+
   // Initialize the TinyUSB device stack
   tusb_init();
 
@@ -110,22 +118,68 @@ int main() {
     tud_task(); // Keep USB stack alive
     sleep_ms(10);
   }
-  printf("Startup complete. Waiting for host...\n");
+
+  // Debug: Verify descriptor sizes (AFTER CDC connection)
+  cdc_printf("=== Descriptor Size Verification ===\n");
+  tud_task();
+  sleep_ms(50);
+  cdc_printf("TUD_CONFIG_DESC_LEN: %d\n", TUD_CONFIG_DESC_LEN);
+  tud_task();
+  sleep_ms(50);
+  cdc_printf("TUD_CDC_DESC_LEN: %d\n", TUD_CDC_DESC_LEN);
+  tud_task();
+  sleep_ms(50);
+  cdc_printf("TUD_BTH_DESC_LEN: %d\n", TUD_BTH_DESC_LEN);
+  tud_task();
+  sleep_ms(50);
+  cdc_printf("CFG_TUD_BTH_ISO_ALT_COUNT: %d\n", CFG_TUD_BTH_ISO_ALT_COUNT);
+  tud_task();
+  sleep_ms(50);
+  cdc_printf("Expected total: %d\n",
+             TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_BTH_DESC_LEN);
+  tud_task();
+  sleep_ms(50);
+  cdc_printf("====================================\n");
+  tud_task();
+  sleep_ms(50);
+
+  cdc_printf("Startup complete. Waiting for host...\n");
+  tud_task();
+  sleep_ms(100);
 
   // Main firmware loop
   while (1) {
-    // Keep the CYW43 and TinyUSB tasks running
-    async_context_poll(cyw43_arch_async_context());
-    tud_task(); // TinyUSB task scheduler
-    cdc_task(); // CDC task (flush/read)
-    led_task(); // Update LED status
+    tud_task();
+    cdc_task();
+    led_task();
 
-    // Periodic status print (every 1s)
+    // Print descriptor info periodically if CDC is connected
     static uint32_t last_print = 0;
-    if (board_millis() - last_print > 1000) {
+    if (tud_cdc_connected() && (board_millis() - last_print > 2000)) {
       last_print = board_millis();
-      printf("Status: Alive. LED State: %d. USB Mounted: %d\n", led_state,
-             tud_mounted());
+
+      cdc_printf("\n=== DESCRIPTOR INFO ===\n");
+      tud_task();
+      sleep_ms(100);
+      cdc_printf("TUD_CONFIG_DESC_LEN: %d\n", TUD_CONFIG_DESC_LEN);
+      tud_task();
+      sleep_ms(100);
+      cdc_printf("TUD_CDC_DESC_LEN: %d\n", TUD_CDC_DESC_LEN);
+      tud_task();
+      sleep_ms(100);
+      cdc_printf("TUD_BTH_DESC_LEN: %d\n", TUD_BTH_DESC_LEN);
+      tud_task();
+      sleep_ms(100);
+      cdc_printf("Total: %d\n",
+                 TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_BTH_DESC_LEN);
+      tud_task();
+      sleep_ms(100);
+      cdc_printf("USB Mounted: %d\n", tud_mounted());
+      tud_task();
+      sleep_ms(100);
+      cdc_printf("=======================\n\n");
+      tud_task();
+      sleep_ms(100);
     }
   }
 }
@@ -184,8 +238,8 @@ tusb_desc_device_t const desc_device = {
     .bcdUSB = USB_BCD,
     // Use TUSB_CLASS_MISC for Composite Device (CDC + Bluetooth)
     .bDeviceClass = TUSB_CLASS_MISC,
-    .bDeviceSubClass = 0x02,
-    .bDeviceProtocol = 0x01,
+    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = USB_VID,
     .idProduct = USB_PID,
@@ -227,11 +281,10 @@ enum {
                                   _iso_ep_in, _iso_ep_out, _iso_ep_size)       \
   /* Interface Associate */                                                    \
   8, TUSB_DESC_INTERFACE_ASSOCIATION, _itfnum, 2,                              \
-      TUSB_CLASS_WIRELESS_CONTROLLER, TUSB_SUBCLASS_WIRELESS_RADIO_FREQUENCY,  \
+      TUSB_CLASS_WIRELESS_CONTROLLER, 0x01,                                    \
       TUD_BT_PROTOCOL_PRIMARY_CONTROLLER, 0, /* Interface 0 (ACL) */           \
       9, TUSB_DESC_INTERFACE, _itfnum, 0, 3, TUSB_CLASS_WIRELESS_CONTROLLER,   \
-      TUSB_SUBCLASS_WIRELESS_RADIO_FREQUENCY,                                  \
-      TUD_BT_PROTOCOL_PRIMARY_CONTROLLER,                                      \
+      0x01, TUD_BT_PROTOCOL_PRIMARY_CONTROLLER,                                \
       _stridx, /* Endpoint In for events */                                    \
       7, TUSB_DESC_ENDPOINT, _ep_evt, TUSB_XFER_INTERRUPT,                     \
       U16_TO_U8S_LE(_ep_evt_size),                                             \
@@ -241,30 +294,30 @@ enum {
       7, TUSB_DESC_ENDPOINT, _ep_out, TUSB_XFER_BULK, U16_TO_U8S_LE(_ep_size), \
       1, /* Interface 1 (ISO) Alt 0 - No Endpoints */                          \
       9, TUSB_DESC_INTERFACE, (uint8_t)((_itfnum) + 1), 0, 0,                  \
-      TUSB_CLASS_WIRELESS_CONTROLLER, TUSB_SUBCLASS_WIRELESS_RADIO_FREQUENCY,  \
+      TUSB_CLASS_WIRELESS_CONTROLLER, 0x01,                                    \
       TUD_BT_PROTOCOL_PRIMARY_CONTROLLER,                                      \
       0, /* Interface 1 (ISO) Alt 1 - 2 Endpoints */                           \
       9, TUSB_DESC_INTERFACE, (uint8_t)((_itfnum) + 1), 1, 2,                  \
-      TUSB_CLASS_WIRELESS_CONTROLLER, TUSB_SUBCLASS_WIRELESS_RADIO_FREQUENCY,  \
+      TUSB_CLASS_WIRELESS_CONTROLLER, 0x01,                                    \
       TUD_BT_PROTOCOL_PRIMARY_CONTROLLER, 0, /* Isochronous endpoints */       \
       7, TUSB_DESC_ENDPOINT, _iso_ep_in, TUSB_XFER_ISOCHRONOUS,                \
       U16_TO_U8S_LE(_iso_ep_size), 1, 7, TUSB_DESC_ENDPOINT, _iso_ep_out,      \
       TUSB_XFER_ISOCHRONOUS, U16_TO_U8S_LE(_iso_ep_size), 1
 
 #define CONFIG_TOTAL_LEN                                                       \
-  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_BTH_DESC_LEN_CUSTOM)
+  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_BTH_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
+    // CDC (2) + BTH ACL (1) + BTH Voice (1) = 4 interfaces
+    TUD_CONFIG_DESCRIPTOR(1, 4, 0, CONFIG_TOTAL_LEN, 0x00, 100),
 
     // CDC Descriptor
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT,
                        EPNUM_CDC_IN, 64),
 
-    // BTH Descriptor
-    TUD_BTH_DESCRIPTOR_CUSTOM(ITF_NUM_BTH, 0, EPNUM_BT_EVT, 16, 0x01,
-                              EPNUM_BT_ACL_OUT, EPNUM_BT_ACL_IN, 64,
-                              EPNUM_BT_ISO_IN, EPNUM_BT_ISO_OUT, 9)};
+    // BTH Descriptor (Standard with ISO)
+    TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, 0, EPNUM_BT_EVT, 16, 0x01, EPNUM_BT_ACL_IN,
+                       EPNUM_BT_ACL_OUT, 64, 0, 9)};
 
 char const *string_desc_arr[] = {
     (char[]){0x09, 0x04}, "Raspberry Pi", "Pico W BT Dongle", "123456",

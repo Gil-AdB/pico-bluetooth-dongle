@@ -40,17 +40,19 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE .)
+target_sources(${PROJECT_NAME} PRIVATE
+  src/main.c
+  src/log_buffer.c
+)
 # 7. Link all necessary libraries to your executable.
 target_link_libraries(${PROJECT_NAME}
-		pico_async_context_base
-		pico_btstack_base
-		pico_btstack_cyw43
-		pico_btstack_ble
-#		pico_cyw43_driver
-		pico_cyw43_arch_threadsafe_background
-#		pico_cyw43_arch_default
 		pico_stdlib
-		pico_rand
+		pico_async_context_base
+		pico_async_context_poll
+		pico_async_context_threadsafe_background
+		pico_cyw43_arch_threadsafe_background
+		pico_btstack_ble
+		pico_btstack_cyw43
 		tinyusb_device
 		tinyusb_board
 )
