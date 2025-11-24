@@ -25,8 +25,11 @@ enum {
   LED_STATE_MOUNTED,  // Fast Blink (5Hz)
   LED_STATE_SUSPENDED // Pulse (Short blink every 2s)
 };
-static volatile int led_state = LED_STATE_IDLE;
-static bool is_dumping_log = false; // Prevent status spam during log dump
+static volatile int led_state = LED_STATE_IDLE; // Global state
+static bool is_dumping_log = false;
+
+// Debug flag - set to true to enable HCI logging (will cause timeouts!)
+#define HCI_DEBUG 1 // Prevent status spam during log dump
 
 // --- CDC Logging ---
 #include "log_buffer.h"
@@ -72,7 +75,7 @@ int cdc_printf(const char *format, ...) {
 }
 
 void cdc_task(void) {
-  // Connected and there is data available
+  // Re-enable log dumps for debugging
   if (tud_cdc_connected() && tud_cdc_available()) {
     is_dumping_log = true;
     // Flush all pending input first
@@ -168,33 +171,78 @@ int main() {
     cdc_task();
     led_task();
 
-    // Periodic status update (every 3 seconds) - helps debugging
-    // Skip if currently dumping log to avoid corruption
+    // Periodic status update (disabled to prevent HCI timeouts)
+    // Uncomment for debugging only
+    /*
     static uint32_t last_status = 0;
     if (!is_dumping_log && (board_millis() - last_status > 3000)) {
       last_status = board_millis();
       cdc_printf("=== STATUS: USB mounted=%d, BT ready=%d ===\n", tud_mounted(),
                  tud_ready());
     }
+    */
   }
 }
 
 // UPSTREAM: CYW43 -> Pico -> Host PC
 void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
                         uint16_t size) {
-  printf("HCI_PACKET_HANDLER: type=0x%02x, channel=0x%04x, size=%u\n",
-         packet_type, channel, size);
   switch (packet_type) {
   case 0x04: // HCI Event
-    tud_bt_event_send(packet, size);
-    printf("  -> Sent HCI Event to USB Host.\n");
-    break;
+  {
+    uint8_t event_code = packet[0];
+
+    // Filter out BTstack internal events (event codes >= 0x60)
+    if (event_code >= 0x60 && event_code < 0xFF) {
+      break; // Silently drop BTstack internal events
+    }
+
+#if HCI_DEBUG
+    cdc_printf("EV:0x%02x\n", event_code);
+#endif
+
+    // Retry sending the event if endpoint is busy
+    bool sent = false;
+    for (int retry = 0; retry < 10; retry++) {
+      bool result = tud_bt_event_send(packet, size);
+      if (result) {
+        sent = true;
+        // Process USB stack to allow host to read the event
+        for (int i = 0; i < 3; i++) {
+          tud_task();
+          busy_wait_us(100);
+        }
+        break;
+      }
+      // Endpoint busy, process USB stack and retry
+      tud_task();
+      busy_wait_us(500);
+    }
+#if HCI_DEBUG
+    if (!sent) {
+      cdc_printf("[ERR] EV:0x%02x FAILED\n", event_code);
+    }
+#endif
+  } break;
   case 0x02: // HCI ACL Data
-    tud_bt_acl_data_send(packet, size);
-    printf("  -> Sent HCI ACL Data to USB Host.\n");
-    break;
+  {
+    // Retry sending the data if endpoint is busy
+    for (int retry = 0; retry < 10; retry++) {
+      bool result = tud_bt_acl_data_send(packet, size);
+      if (result) {
+        // Process USB stack to allow host to read the data
+        for (int i = 0; i < 3; i++) {
+          tud_task();
+          busy_wait_us(100);
+        }
+        break;
+      }
+      // Endpoint busy, process USB stack and retry
+      tud_task();
+      busy_wait_us(500);
+    }
+  } break;
   default:
-    printf("  -> Unhandled HCI Packet Type to USB Host: 0x%02x\n", packet_type);
     break;
   }
   return;
@@ -208,17 +256,49 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
 // the BTstack HCI transport.
 
 void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
-  printf("TUD_BT_HCI_CMD_CB: len=%u\n", cmd_len);
+  uint8_t *cmd = (uint8_t *)hci_cmd;
+  uint16_t opcode = cmd[0] | (cmd[1] << 8);
+
+#if HCI_DEBUG
+  cdc_printf("CMD:0x%04x\n", opcode);
+#endif
+
+  // Intercept HCI Read Local Extended Features (0x1004)
+  // CYW43 firmware doesn't support this command, so we synthesize a response
+  if (opcode == 0x1004) {
+    // HCI Command Complete Event for Read Local Extended Features
+    // Format: Event Code (0x0E) | Length | Num_HCI_Command_Packets | Opcode |
+    // Status | Page_Number | Max_Page_Number | Extended_Features[8]
+    uint8_t response[] = {
+        0x0E,       // Event Code: Command Complete
+        0x0E,       // Parameter Length: 14 bytes
+        0x01,       // Num_HCI_Command_Packets: 1
+        0x04, 0x10, // Opcode: 0x1004 (little-endian)
+        0x00,       // Status: Success
+        0x00,       // Page_Number: 0 (from command parameter)
+        0x00,       // Max_Page_Number: 0 (no extended pages)
+        // Extended_Features[8]: All zeros (no extended features)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+#if HCI_DEBUG
+    cdc_printf("  -> Synthesized response for 0x1004\n");
+#endif
+
+    // Send the synthesized event directly
+    hci_packet_handler(HCI_EVENT_PACKET, 0, response, sizeof(response));
+    return;
+  }
+
+  // Forward all other commands to CYW43
   hci_transport_cyw43_instance()->send_packet(HCI_COMMAND_DATA_PACKET,
                                               (uint8_t *)hci_cmd, cmd_len);
-  printf("  -> Forwarded HCI Command to CYW43.\n");
 }
 
 void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
-  printf("TUD_BT_ACL_DATA_RECEIVED_CB: len=%u\n", data_len);
+  cdc_printf("TUD_BT_ACL_DATA_RECEIVED_CB: len=%u\n", data_len);
   hci_transport_cyw43_instance()->send_packet(HCI_ACL_DATA_PACKET,
                                               (uint8_t *)acl_data, data_len);
-  printf("  -> Forwarded HCI ACL Data to CYW43.\n");
+  cdc_printf("  -> Forwarded HCI ACL Data to CYW43.\n");
 }
 
 // --- USB Descriptors ---
