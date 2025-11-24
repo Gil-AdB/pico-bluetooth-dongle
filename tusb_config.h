@@ -37,8 +37,8 @@ int cdc_printf(const char *format, ...);
 #define CFG_TUD_BTH_ISO_ALT_COUNT 2
 
 #define CFG_TUD_CDC 1
-#define CFG_TUD_CDC_RX_BUFSIZE 64
-#define CFG_TUD_CDC_TX_BUFSIZE 64
+#define CFG_TUD_CDC_RX_BUFSIZE 512
+#define CFG_TUD_CDC_TX_BUFSIZE 512
 
 #ifdef __cplusplus
 }

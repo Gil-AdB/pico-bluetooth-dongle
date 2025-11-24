@@ -4,14 +4,20 @@
 static char log_buffer[LOG_BUFFER_SIZE];
 static uint32_t log_write_pos = 0;
 static bool log_wrapped = false;
+static bool log_dumping = false; // Prevent recursion during dump
 
 void log_buffer_init(void) {
   memset(log_buffer, 0, LOG_BUFFER_SIZE);
   log_write_pos = 0;
   log_wrapped = false;
+  log_dumping = false;
 }
 
 void log_buffer_append(const char *str, int len) {
+  // Don't append during dump to avoid corruption
+  if (log_dumping)
+    return;
+
   for (int i = 0; i < len; i++) {
     log_buffer[log_write_pos] = str[i];
     log_write_pos++;
@@ -25,6 +31,8 @@ void log_buffer_append(const char *str, int len) {
 void log_buffer_dump(void (*output_fn)(const char *, int)) {
   const char *header = "\n=== LOG BUFFER DUMP ===\n";
   const char *footer = "\n=== END LOG BUFFER ===\n";
+
+  log_dumping = true; // Prevent appending during dump
 
   output_fn(header, strlen(header));
 
@@ -42,6 +50,13 @@ void log_buffer_dump(void (*output_fn)(const char *, int)) {
   }
 
   output_fn(footer, strlen(footer));
+
+  log_dumping = false; // Re-enable logging
+}
+
+void log_buffer_clear(void) {
+  log_write_pos = 0;
+  log_wrapped = false;
 }
 
 uint32_t log_buffer_get_size(void) {

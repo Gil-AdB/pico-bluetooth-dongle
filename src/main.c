@@ -26,6 +26,7 @@ enum {
   LED_STATE_SUSPENDED // Pulse (Short blink every 2s)
 };
 static volatile int led_state = LED_STATE_IDLE;
+static bool is_dumping_log = false; // Prevent status spam during log dump
 
 // --- CDC Logging ---
 #include "log_buffer.h"
@@ -33,8 +34,16 @@ static volatile int led_state = LED_STATE_IDLE;
 // Output function for log dump to CDC
 void cdc_output(const char *str, int len) {
   if (tud_cdc_connected()) {
-    tud_cdc_write(str, len);
-    tud_cdc_write_flush();
+    int written = 0;
+    while (written < len) {
+      int n = tud_cdc_write(str + written, len - written);
+      if (n > 0) {
+        written += n;
+        tud_cdc_write_flush();
+      }
+      tud_task();        // Let USB stack process
+      busy_wait_us(100); // Yield CPU time
+    }
   }
 }
 
@@ -65,9 +74,15 @@ int cdc_printf(const char *format, ...) {
 void cdc_task(void) {
   // Connected and there is data available
   if (tud_cdc_connected() && tud_cdc_available()) {
-    // Read data to clear buffer (echo back or ignore)
+    is_dumping_log = true;
+    // Flush all pending input first
     char buf[64];
-    tud_cdc_read(buf, sizeof(buf));
+    while (tud_cdc_available()) {
+      tud_cdc_read(buf, sizeof(buf));
+    }
+    // Dump the log buffer once
+    log_buffer_dump(cdc_output);
+    is_dumping_log = false;
   }
 }
 
@@ -153,33 +168,13 @@ int main() {
     cdc_task();
     led_task();
 
-    // Print descriptor info periodically if CDC is connected
-    static uint32_t last_print = 0;
-    if (tud_cdc_connected() && (board_millis() - last_print > 2000)) {
-      last_print = board_millis();
-
-      cdc_printf("\n=== DESCRIPTOR INFO ===\n");
-      tud_task();
-      sleep_ms(100);
-      cdc_printf("TUD_CONFIG_DESC_LEN: %d\n", TUD_CONFIG_DESC_LEN);
-      tud_task();
-      sleep_ms(100);
-      cdc_printf("TUD_CDC_DESC_LEN: %d\n", TUD_CDC_DESC_LEN);
-      tud_task();
-      sleep_ms(100);
-      cdc_printf("TUD_BTH_DESC_LEN: %d\n", TUD_BTH_DESC_LEN);
-      tud_task();
-      sleep_ms(100);
-      cdc_printf("Total: %d\n",
-                 TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_BTH_DESC_LEN);
-      tud_task();
-      sleep_ms(100);
-      cdc_printf("USB Mounted: %d\n", tud_mounted());
-      tud_task();
-      sleep_ms(100);
-      cdc_printf("=======================\n\n");
-      tud_task();
-      sleep_ms(100);
+    // Periodic status update (every 3 seconds) - helps debugging
+    // Skip if currently dumping log to avoid corruption
+    static uint32_t last_status = 0;
+    if (!is_dumping_log && (board_millis() - last_status > 3000)) {
+      last_status = board_millis();
+      cdc_printf("=== STATUS: USB mounted=%d, BT ready=%d ===\n", tud_mounted(),
+                 tud_ready());
     }
   }
 }
@@ -228,7 +223,7 @@ void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
 
 // --- USB Descriptors ---
 #define USB_VID 0x2E8A // Raspberry Pi
-#define USB_PID 0x000C // A new PID for this project
+#define USB_PID 0x0013 // A new PID for this project
 #define USB_BCD 0x0200
 
 // --- Device Descriptor ---
@@ -255,23 +250,23 @@ tusb_desc_device_t const desc_device = {
 // Total Interfaces: 4
 
 enum {
-  ITF_NUM_CDC = 0,
-  ITF_NUM_CDC_DATA,
-  ITF_NUM_BTH,
+  ITF_NUM_BTH = 0,
   ITF_NUM_BTH_VOICE,
+  ITF_NUM_CDC,
+  ITF_NUM_CDC_DATA,
   ITF_NUM_TOTAL
 };
 
 // Endpoints
 // Endpoints
-#define EPNUM_CDC_NOTIF 0x81
-#define EPNUM_CDC_OUT 0x02
-#define EPNUM_CDC_IN 0x82
-#define EPNUM_BT_EVT 0x83
-#define EPNUM_BT_ACL_OUT 0x04
-#define EPNUM_BT_ACL_IN 0x84
-#define EPNUM_BT_ISO_OUT 0x05
-#define EPNUM_BT_ISO_IN 0x85
+#define EPNUM_BT_EVT 0x81
+#define EPNUM_BT_ACL_OUT 0x02
+#define EPNUM_BT_ACL_IN 0x82
+#define EPNUM_BT_ISO_OUT 0x03
+#define EPNUM_BT_ISO_IN 0x83
+#define EPNUM_CDC_NOTIF 0x84
+#define EPNUM_CDC_OUT 0x05
+#define EPNUM_CDC_IN 0x85
 
 // Custom BTH Descriptor with Empty Alt 0 for ISO
 // Length: 8 (IAD) + 30 (ACL) + 9 (ISO Alt 0) + 23 (ISO Alt 1) = 70 bytes
@@ -308,16 +303,16 @@ enum {
   (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_BTH_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
-    // CDC (2) + BTH ACL (1) + BTH Voice (1) = 4 interfaces
+    // BTH ACL (1) + BTH Voice (1) + CDC (2) = 4 interfaces
     TUD_CONFIG_DESCRIPTOR(1, 4, 0, CONFIG_TOTAL_LEN, 0x00, 100),
-
-    // CDC Descriptor
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT,
-                       EPNUM_CDC_IN, 64),
 
     // BTH Descriptor (Standard with ISO)
     TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, 0, EPNUM_BT_EVT, 16, 0x01, EPNUM_BT_ACL_IN,
-                       EPNUM_BT_ACL_OUT, 64, 0, 9)};
+                       EPNUM_BT_ACL_OUT, 64, 0, 9),
+
+    // CDC Descriptor
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT,
+                       EPNUM_CDC_IN, 64)};
 
 char const *string_desc_arr[] = {
     (char[]){0x09, 0x04}, "Raspberry Pi", "Pico W BT Dongle", "123456",

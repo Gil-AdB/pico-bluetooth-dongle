@@ -66,6 +66,12 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 		CYW43_LWIP=0
 		PICO_STDIO_USB=0
 		PICO_STDIO_UART=1
+		CFG_TUD_BTH=1
+)
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # 9. Ensure the final .uf2 file is generated for flashing.
