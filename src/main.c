@@ -6,7 +6,8 @@
 #include "hci.h"
 #include "pico/btstack_cyw43.h"
 #include "pico/btstack_hci_transport_cyw43.h"
-#include "pico/btstack_run_loop_async_context.h"
+// #include "pico/btstack_run_loop_async_context.h" // Removed: File not found
+// and unused
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 #include "tusb.h"
@@ -29,7 +30,15 @@ static volatile int led_state = LED_STATE_IDLE; // Global state
 static bool is_dumping_log = false;
 
 // Debug flag - set to true to enable HCI logging (will cause timeouts!)
-#define HCI_DEBUG 1 // Prevent status spam during log dump
+#define HCI_DEBUG 1
+
+// Deferred synthetic HCI response for 0x1004
+static volatile bool pending_0x1004_response = false;
+static volatile uint8_t pending_0x1004_page = 0;
+
+// CRITICAL: Static buffer for synthetic 0x1004 response
+// Must be static because TinyUSB transmits asynchronously!
+static uint8_t synthetic_response_buffer[16];
 
 // --- CDC Logging ---
 #include "log_buffer.h"
@@ -61,10 +70,27 @@ int cdc_printf(const char *format, ...) {
     // Store in log buffer
     log_buffer_append(buf, len);
 
-    // Filter out TinyUSB internal logs to prevent infinite loops
-    if ((buf[0] == ' ' && buf[1] == ' ') ||
-        strstr(buf, "USBD Xfer Complete") != NULL ||
-        strstr(buf, "USBD Setup") != NULL) {
+    // Strict Whitelist Filter to prevent infinite recursion
+    // We only allow logs that contain specific keywords related to Bluetooth or
+    // Control EP. Everything else (especially CDC logs) is blocked.
+    bool allowed = false;
+
+    // Whitelist Endpoints: 00 (Control), 81 (Event), 02 (ACL Out), 82 (ACL In)
+    if (strstr(buf, "EP 00") || strstr(buf, "EP 0x00") ||
+        strstr(buf, "EP 81") || strstr(buf, "EP 0x81") ||
+        strstr(buf, "EP 02") || strstr(buf, "EP 0x02") ||
+        strstr(buf, "EP 82") || strstr(buf, "EP 0x82")) {
+      allowed = true;
+    }
+
+    // Whitelist Application Logs
+    if (strstr(buf, "HCI") || strstr(buf, "ACL") || strstr(buf, "EV:") ||
+        strstr(buf, "CMD:") || strstr(buf, "Synthetic") ||
+        strstr(buf, "Pico")) {
+      allowed = true;
+    }
+
+    if (!allowed) {
       return len;
     }
 
@@ -137,30 +163,6 @@ int main() {
     sleep_ms(10);
   }
 
-  // Debug: Verify descriptor sizes (AFTER CDC connection)
-  cdc_printf("=== Descriptor Size Verification ===\n");
-  tud_task();
-  sleep_ms(50);
-  cdc_printf("TUD_CONFIG_DESC_LEN: %d\n", TUD_CONFIG_DESC_LEN);
-  tud_task();
-  sleep_ms(50);
-  cdc_printf("TUD_CDC_DESC_LEN: %d\n", TUD_CDC_DESC_LEN);
-  tud_task();
-  sleep_ms(50);
-  cdc_printf("TUD_BTH_DESC_LEN: %d\n", TUD_BTH_DESC_LEN);
-  tud_task();
-  sleep_ms(50);
-  cdc_printf("CFG_TUD_BTH_ISO_ALT_COUNT: %d\n", CFG_TUD_BTH_ISO_ALT_COUNT);
-  tud_task();
-  sleep_ms(50);
-  cdc_printf("Expected total: %d\n",
-             TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_BTH_DESC_LEN);
-  tud_task();
-  sleep_ms(50);
-  cdc_printf("====================================\n");
-  tud_task();
-  sleep_ms(50);
-
   cdc_printf("Startup complete. Waiting for host...\n");
   tud_task();
   sleep_ms(100);
@@ -204,17 +206,10 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
     // Retry sending the event if endpoint is busy
     bool sent = false;
     for (int retry = 0; retry < 10; retry++) {
-      bool result = tud_bt_event_send(packet, size);
-      if (result) {
+      if (tud_bt_event_send(packet, size)) {
         sent = true;
-        // Process USB stack to allow host to read the event
-        for (int i = 0; i < 3; i++) {
-          tud_task();
-          busy_wait_us(100);
-        }
         break;
       }
-      // Endpoint busy, process USB stack and retry
       tud_task();
       busy_wait_us(500);
     }
@@ -224,12 +219,17 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
     }
 #endif
   } break;
-  case 0x02: // HCI ACL Data
+  case 0x02: // HCI ACL Data (CYW43 -> Host)
   {
+#if HCI_DEBUG
+    cdc_printf("ACL_UP:%d\n", size);
+#endif
     // Retry sending the data if endpoint is busy
+    bool acl_sent = false;
     for (int retry = 0; retry < 10; retry++) {
       bool result = tud_bt_acl_data_send(packet, size);
       if (result) {
+        acl_sent = true;
         // Process USB stack to allow host to read the data
         for (int i = 0; i < 3; i++) {
           tud_task();
@@ -241,6 +241,11 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
       tud_task();
       busy_wait_us(500);
     }
+#if HCI_DEBUG
+    if (!acl_sent) {
+      cdc_printf("[ERR] ACL_UP FAILED %d\n", size);
+    }
+#endif
   } break;
   default:
     break;
@@ -252,10 +257,22 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
 // The original `tud_bt_hci_rx_cb` function is not compatible with TinyUSB's BTH
 // device class API. We have implemented `tud_bt_hci_cmd_cb` and
 // `tud_bt_acl_data_received_cb` instead. These functions will receive parsed
-// HCI commands and ACL data from the USB host. They will then forward these to
-// the BTstack HCI transport.
+// HCI commands and ACL data from the USB host.
 
+// Called by TinyUSB when an HCI event has been successfully transmitted
+void tud_bt_event_sent_cb(uint16_t sent_bytes) {
+#if HCI_DEBUG
+  cdc_printf("[USB] Event sent callback: %d bytes transmitted\n", sent_bytes);
+#endif
+}
+
+// DOWNSTREAM: Host PC -> Pico -> CYW43
 void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
+  // Safety check: Ensure command has at least opcode (2 bytes)
+  if (cmd_len < 2) {
+    return;
+  }
+
   uint8_t *cmd = (uint8_t *)hci_cmd;
   uint16_t opcode = cmd[0] | (cmd[1] << 8);
 
@@ -264,28 +281,51 @@ void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
 #endif
 
   // Intercept HCI Read Local Extended Features (0x1004)
-  // CYW43 firmware doesn't support this command, so we synthesize a response
   if (opcode == 0x1004) {
-    // HCI Command Complete Event for Read Local Extended Features
-    // Format: Event Code (0x0E) | Length | Num_HCI_Command_Packets | Opcode |
-    // Status | Page_Number | Max_Page_Number | Extended_Features[8]
-    uint8_t response[] = {
-        0x0E,       // Event Code: Command Complete
-        0x0E,       // Parameter Length: 14 bytes
-        0x01,       // Num_HCI_Command_Packets: 1
-        0x04, 0x10, // Opcode: 0x1004 (little-endian)
-        0x00,       // Status: Success
-        0x00,       // Page_Number: 0 (from command parameter)
-        0x00,       // Max_Page_Number: 0 (no extended pages)
-        // Extended_Features[8]: All zeros (no extended features)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t page_number = (cmd_len >= 4) ? cmd[3] : 0;
 
 #if HCI_DEBUG
-    cdc_printf("  -> Synthesized response for 0x1004\n");
+    cdc_printf("  -> Intercepting 0x1004 (page %d), replying immediately\n",
+               page_number);
 #endif
 
-    // Send the synthesized event directly
-    hci_packet_handler(HCI_EVENT_PACKET, 0, response, sizeof(response));
+    // Prepare Synthetic Response Buffer
+    // Must be static to ensure validity after function returns (if passed by
+    // reference)
+    static uint8_t synth_resp[16];
+
+    synth_resp[0] = 0x0E; // Event Code: Command Complete
+    synth_resp[1] = 0x0E; // Parameter Length: 14 bytes
+    synth_resp[2] = 0x01; // Num_HCI_Command_Packets: 1
+    synth_resp[3] = 0x04; // Opcode low byte
+    synth_resp[4] = 0x10; // Opcode high byte (0x1004)
+
+    // Return Parameters
+    if (page_number <= 1) {
+      synth_resp[5] = 0x00;         // Status: SUCCESS
+      synth_resp[6] = page_number;  // Page_Number
+      synth_resp[7] = 0x01;         // Max_Page_Number: 1
+      memset(&synth_resp[8], 0, 8); // Features: zeros for now
+    } else {
+      synth_resp[5] = 0x12; // Status: Invalid Parameters
+      synth_resp[6] = page_number;
+      synth_resp[7] = 0x01;
+      memset(&synth_resp[8], 0, 8);
+    }
+
+    // Attempt to send response immediately
+    // CRITICAL: Do NOT call tud_task() here as we are already in a TinyUSB
+    // callback!
+    if (tud_bt_event_send(synth_resp, sizeof(synth_resp))) {
+      return; // SUCCESS: Sent. DO NOT forward.
+    }
+
+// If buffer is full, we have a problem.
+// Ideally we should queue this, but for now we log error.
+// Forwarding it to CYW43 won't help as it doesn't support it.
+#if HCI_DEBUG
+    cdc_printf("[ERR] Failed to send synthetic 0x1004 response (BUSY)\n");
+#endif
     return;
   }
 
@@ -387,8 +427,11 @@ uint8_t const desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, 4, 0, CONFIG_TOTAL_LEN, 0x00, 100),
 
     // BTH Descriptor (Standard with ISO)
-    TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, 0, EPNUM_BT_EVT, 16, 0x01, EPNUM_BT_ACL_IN,
-                       EPNUM_BT_ACL_OUT, 64, 0, 9),
+    // Using 9 bytes for ISO endpoint size (standard for alt setting 0/1
+    // variants in some configs)
+    TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, 0, EPNUM_BT_EVT, 64, 0x01, EPNUM_BT_ACL_IN,
+                       EPNUM_BT_ACL_OUT, 64, EPNUM_BT_ISO_IN, EPNUM_BT_ISO_OUT,
+                       9),
 
     // CDC Descriptor
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT,

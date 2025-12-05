@@ -27,7 +27,7 @@ extern "C" {
 #ifdef CFG_TUSB_DEBUG
 #undef CFG_TUSB_DEBUG
 #endif
-#define CFG_TUSB_DEBUG 0
+#define CFG_TUSB_DEBUG 2
 
 // Redirect TinyUSB debug output to our custom CDC printf
 #define CFG_TUSB_DEBUG_PRINTF cdc_printf
