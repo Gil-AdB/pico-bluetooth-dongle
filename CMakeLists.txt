@@ -43,6 +43,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE .)
 target_sources(${PROJECT_NAME} PRIVATE
   src/main.c
   src/log_buffer.c
+  src/hci_packet_queue.c
 )
 # 7. Link all necessary libraries to your executable.
 target_link_libraries(${PROJECT_NAME}
@@ -60,14 +61,18 @@ target_link_libraries(${PROJECT_NAME}
 # 8. Add project-specific compile definitions.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
 		PICO_CYW43_ARCH_BLUETOOTH_ENABLED=1
-		TUSB_CONFIG_FILE="tusb_config.h"
+		TUSB_CONFIG_FILE="my_tusb_config.h"
 		PICO_CYW43_SUPPORTED
 		ENABLE_BLE=1
 		CYW43_LWIP=0
 		PICO_STDIO_USB=0
 		PICO_STDIO_UART=1
 		CFG_TUD_BTH=1
+		CFG_TUSB_DEBUG=0
 )
+
+# Enable RTT for SWD logging
+# pico_enable_stdio_rtt(${PROJECT_NAME} 1)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

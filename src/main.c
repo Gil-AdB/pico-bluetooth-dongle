@@ -8,11 +8,16 @@
 #include "pico/btstack_hci_transport_cyw43.h"
 // #include "pico/btstack_run_loop_async_context.h" // Removed: File not found
 // and unused
+#include "hci_packet_queue.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 #include "tusb.h"
 #include <stdarg.h>
 #include <string.h>
+
+// Buffer for assembling fragmented ACL packets from USB
+static uint8_t acl_reassembly_buf[2048];
+static uint16_t acl_reassembly_len = 0;
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
@@ -52,9 +57,9 @@ void cdc_output(const char *str, int len) {
       if (n > 0) {
         written += n;
         tud_cdc_write_flush();
+      } else {
+        break;
       }
-      tud_task();        // Let USB stack process
-      busy_wait_us(100); // Yield CPU time
     }
   }
 }
@@ -96,6 +101,10 @@ int cdc_printf(const char *format, ...) {
 
     // Write to CDC if connected
     cdc_output(buf, len);
+
+    // ALSO Write to UART (stdout) for debugging via Bridge
+    // simple printf would work since stdout is mapped to UART
+    printf("%s", buf);
   }
   return len;
 }
@@ -117,44 +126,49 @@ void cdc_task(void) {
 
 // --- Main Loop ---
 int main() {
+  // Initialize HCI packet queue FIRST - before ANY other init!
+  // This must happen before cyw43_arch_init() which can trigger BT activity
+  hci_packet_queue_init();
+
   board_init();
   stdio_init_all();
   printf("Pico W Bluetooth Dongle started.\n");
 
+  // Initialize log buffer IMMEDIATELY after stdio
+  // This ensures any early logs (from SDK or elsewhere) don't crash the system
+  log_buffer_init();
+
   if (cyw43_arch_init()) {
-    // Initialization failed, blink LED rapidly
-    while (true) {
-      cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-      sleep_ms(50);
-      cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-      sleep_ms(50);
-    }
+    printf("CYW43 init failed\n");
+    return -1;
   }
 
   // Initialise BTstack
-  if (!btstack_cyw43_init(cyw43_arch_async_context())) {
-    printf("Failed to init BTstack CYW43\n");
-    // Handle error, e.g., blink LED rapidly
-    while (true) {
-      cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-      sleep_ms(50);
-      cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-      sleep_ms(50);
-    }
-  }
+  // Note: cyw43_arch_init() handles BTstack initialization on Pico 2 W.
+  // Explicit call to btstack_cyw43_init() is not required and causes assertion
+  // failure.
 
   // inform about BTstack state
-  hci_event_callback_registration.callback = &hci_packet_handler;
-  hci_add_event_handler(&hci_event_callback_registration);
+  // DISABLED: We don't want duplicate events. Transport patch handles
+  // forwarding. hci_event_callback_registration.callback = &hci_packet_handler;
+  // hci_add_event_handler(&hci_event_callback_registration);
 
   // turn on bluetooth!
-  hci_power_control(HCI_POWER_ON);
+  // DISABLED: We want the HOST (PC) to control the device state.
+  // hci_power_control(HCI_POWER_ON);
 
-  // Initialize log buffer
-  log_buffer_init();
+  // Antigravity Fix: Manually open transport to wake up chip, but don't start
+  // BTstack logic.
+  const hci_transport_t *transport = hci_transport_cyw43_instance();
+  // transport->init(NULL); // Not strictly needed as we don't use BTstack
+  // config
+  transport->open();
 
-  // Initialize the TinyUSB device stack
+  // Initialize TinyUSB
   tusb_init();
+
+  // Start main loop
+  printf("Entering main loop\n");
 
   // Wait for CDC connection (up to 5 seconds) to allow catching startup logs
   uint32_t wait_start = board_millis();
@@ -172,6 +186,39 @@ int main() {
     tud_task();
     cdc_task();
     led_task();
+
+#if 1
+    // Process HCI packet queue (forward CYW43 packets to USB)
+    hci_packet_entry_t *pkt;
+    while ((pkt = hci_packet_queue_dequeue()) != NULL) {
+      if (pkt->packet_type == 0x04) { // HCI Event
+        uint8_t event_code = pkt->data[0];
+        // Filter BTstack internal events
+        if (event_code >= 0x60 && event_code < 0xFF) {
+          continue;
+        }
+#if HCI_DEBUG
+        cdc_printf("EV:0x%02x\n", event_code);
+#endif
+        for (int retry = 0; retry < 10; retry++) {
+          if (tud_bt_event_send(pkt->data, pkt->size))
+            break;
+          tud_task();
+          busy_wait_us(500);
+        }
+      } else if (pkt->packet_type == 0x02) { // HCI ACL Data
+#if HCI_DEBUG
+        cdc_printf("ACL_UP:%d\n", pkt->size);
+#endif
+        for (int retry = 0; retry < 10; retry++) {
+          if (tud_bt_acl_data_send(pkt->data, pkt->size))
+            break;
+          tud_task();
+          busy_wait_us(500);
+        }
+      }
+    }
+#endif
 
     // Periodic status update (disabled to prevent HCI timeouts)
     // Uncomment for debugging only
@@ -199,53 +246,21 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
       break; // Silently drop BTstack internal events
     }
 
-#if HCI_DEBUG
-    cdc_printf("EV:0x%02x\n", event_code);
-#endif
+    // cdc_printf("EV:0x%02x\n", event_code);
 
-    // Retry sending the event if endpoint is busy
-    bool sent = false;
-    for (int retry = 0; retry < 10; retry++) {
-      if (tud_bt_event_send(packet, size)) {
-        sent = true;
-        break;
-      }
-      tud_task();
-      busy_wait_us(500);
+    // Enqueue for main loop processing (Thread Safe)
+    if (!hci_packet_queue_enqueue(0x04, packet, size)) {
+      // cdc_printf("[ERR] Queue Full EV:0x%02x\n", event_code);
     }
-#if HCI_DEBUG
-    if (!sent) {
-      cdc_printf("[ERR] EV:0x%02x FAILED\n", event_code);
-    }
-#endif
   } break;
   case 0x02: // HCI ACL Data (CYW43 -> Host)
   {
-#if HCI_DEBUG
-    cdc_printf("ACL_UP:%d\n", size);
-#endif
-    // Retry sending the data if endpoint is busy
-    bool acl_sent = false;
-    for (int retry = 0; retry < 10; retry++) {
-      bool result = tud_bt_acl_data_send(packet, size);
-      if (result) {
-        acl_sent = true;
-        // Process USB stack to allow host to read the data
-        for (int i = 0; i < 3; i++) {
-          tud_task();
-          busy_wait_us(100);
-        }
-        break;
-      }
-      // Endpoint busy, process USB stack and retry
-      tud_task();
-      busy_wait_us(500);
+    // cdc_printf("ACL_UP:%d\n", size);
+
+    // Enqueue for main loop processing (Thread Safe)
+    if (!hci_packet_queue_enqueue(0x02, packet, size)) {
+      // cdc_printf("[ERR] Queue Full ACL:%d\n", size);
     }
-#if HCI_DEBUG
-    if (!acl_sent) {
-      cdc_printf("[ERR] ACL_UP FAILED %d\n", size);
-    }
-#endif
   } break;
   default:
     break;
@@ -280,65 +295,59 @@ void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
   cdc_printf("CMD:0x%04x\n", opcode);
 #endif
 
-  // Intercept HCI Read Local Extended Features (0x1004)
-  if (opcode == 0x1004) {
-    uint8_t page_number = (cmd_len >= 4) ? cmd[3] : 0;
-
-#if HCI_DEBUG
-    cdc_printf("  -> Intercepting 0x1004 (page %d), replying immediately\n",
-               page_number);
-#endif
-
-    // Prepare Synthetic Response Buffer
-    // Must be static to ensure validity after function returns (if passed by
-    // reference)
-    static uint8_t synth_resp[16];
-
-    synth_resp[0] = 0x0E; // Event Code: Command Complete
-    synth_resp[1] = 0x0E; // Parameter Length: 14 bytes
-    synth_resp[2] = 0x01; // Num_HCI_Command_Packets: 1
-    synth_resp[3] = 0x04; // Opcode low byte
-    synth_resp[4] = 0x10; // Opcode high byte (0x1004)
-
-    // Return Parameters
-    if (page_number <= 1) {
-      synth_resp[5] = 0x00;         // Status: SUCCESS
-      synth_resp[6] = page_number;  // Page_Number
-      synth_resp[7] = 0x01;         // Max_Page_Number: 1
-      memset(&synth_resp[8], 0, 8); // Features: zeros for now
-    } else {
-      synth_resp[5] = 0x12; // Status: Invalid Parameters
-      synth_resp[6] = page_number;
-      synth_resp[7] = 0x01;
-      memset(&synth_resp[8], 0, 8);
-    }
-
-    // Attempt to send response immediately
-    // CRITICAL: Do NOT call tud_task() here as we are already in a TinyUSB
-    // callback!
-    if (tud_bt_event_send(synth_resp, sizeof(synth_resp))) {
-      return; // SUCCESS: Sent. DO NOT forward.
-    }
-
-// If buffer is full, we have a problem.
-// Ideally we should queue this, but for now we log error.
-// Forwarding it to CYW43 won't help as it doesn't support it.
-#if HCI_DEBUG
-    cdc_printf("[ERR] Failed to send synthetic 0x1004 response (BUSY)\n");
-#endif
-    return;
-  }
-
   // Forward all other commands to CYW43
   hci_transport_cyw43_instance()->send_packet(HCI_COMMAND_DATA_PACKET,
                                               (uint8_t *)hci_cmd, cmd_len);
 }
 
 void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
-  cdc_printf("TUD_BT_ACL_DATA_RECEIVED_CB: len=%u\n", data_len);
-  hci_transport_cyw43_instance()->send_packet(HCI_ACL_DATA_PACKET,
-                                              (uint8_t *)acl_data, data_len);
-  cdc_printf("  -> Forwarded HCI ACL Data to CYW43.\n");
+#if HCI_DEBUG
+  cdc_printf("TUD_BT_ACL_DATA_RECEIVED_CB: total_len=%u\n", data_len);
+#endif
+
+  // Preventing buffer overflow
+  if (acl_reassembly_len + data_len > sizeof(acl_reassembly_buf)) {
+#if HCI_DEBUG
+    cdc_printf("ACL Reassembly Overflow! Resetting.\n");
+#endif
+    acl_reassembly_len = 0;
+  }
+
+  // Append new data
+  memcpy(&acl_reassembly_buf[acl_reassembly_len], acl_data, data_len);
+  acl_reassembly_len += data_len;
+
+  // Process Buffer
+  while (acl_reassembly_len >= 4) {
+    // ACL Header: Handle(2) + DataLen(2)
+    uint16_t data_total_len =
+        acl_reassembly_buf[2] | (acl_reassembly_buf[3] << 8);
+    uint16_t packet_total_len = 4 + data_total_len;
+
+    if (acl_reassembly_len >= packet_total_len) {
+      // We have a complete packet
+      hci_transport_cyw43_instance()->send_packet(
+          HCI_ACL_DATA_PACKET, acl_reassembly_buf, packet_total_len);
+#if HCI_DEBUG
+      cdc_printf("  -> Forwarded Reassembled ACL (Size: %u)\n",
+                 packet_total_len);
+#endif
+
+      // Move remaining data to front
+      uint16_t remaining = acl_reassembly_len - packet_total_len;
+      if (remaining > 0) {
+        memmove(acl_reassembly_buf, &acl_reassembly_buf[packet_total_len],
+                remaining);
+        acl_reassembly_len = remaining;
+      } else {
+        acl_reassembly_len = 0;
+        break;
+      }
+    } else {
+      // Incomplete packet, wait for more data
+      break;
+    }
+  }
 }
 
 // --- USB Descriptors ---
