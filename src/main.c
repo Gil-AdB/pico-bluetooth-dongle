@@ -15,14 +15,23 @@
 #include <stdarg.h>
 #include <string.h>
 
+// --- DEBUGGING ---
+// Uncomment to enable verbose serial logs
+// #define DEBUG_LOGS
+
+#ifdef DEBUG_LOGS
+  #define DBG_PRINTF(...) printf(__VA_ARGS__)
+#else
+  #define DBG_PRINTF(...)
+#endif
+
 // Buffer for assembling fragmented ACL packets from USB
 static uint8_t acl_reassembly_buf[2048];
 static uint16_t acl_reassembly_len = 0;
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
-void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
-                        uint16_t size);
+void hci_packet_handler(uint8_t packet_type, uint8_t *packet, uint16_t size);
 void led_task(void);
 
 // --- LED Status ---
@@ -62,9 +71,9 @@ int main() {
   // Explicit call to btstack_cyw43_init() is not required and causes assertion
   // failure.
 
-  hci_event_callback_registration.callback = &hci_packet_handler;
-  hci_add_event_handler(&hci_event_callback_registration);
-  hci_register_acl_packet_handler(&hci_packet_handler);
+  // hci_event_callback_registration.callback = &hci_packet_handler;
+  // hci_add_event_handler(&hci_event_callback_registration);
+  // hci_register_acl_packet_handler(&hci_packet_handler);
 
   // turn on bluetooth!
   // DISABLED: We want the HOST (PC) to control the device state.
@@ -73,8 +82,8 @@ int main() {
   // Antigravity Fix: Manually open transport to wake up chip, but don't start
   // BTstack logic.
   const hci_transport_t *transport = hci_transport_cyw43_instance();
-  // transport->init(NULL); // Not strictly needed as we don't use BTstack
-  // config
+  transport->init(NULL); // Not strictly needed as we don't use BTstack config
+  transport->register_packet_handler(&hci_packet_handler);
   transport->open();
 
   // Initialize TinyUSB
@@ -88,43 +97,50 @@ int main() {
     tud_task();
     led_task();
 
-#if 1
     // Process HCI packet queue (forward CYW43 packets to USB)
     hci_packet_entry_t *pkt;
+
+    // Dequeue packets (Thread Safe Access assumed per new queue implementation)
     while ((pkt = hci_packet_queue_dequeue()) != NULL) {
-      if (pkt->packet_type == 0x04) { // HCI Event
-        uint8_t event_code = pkt->data[0];
-        // Filter BTstack internal events
-        if (event_code >= 0x60 && event_code < 0xFF) {
-          continue;
-        }
-        for (int retry = 0; retry < 10; retry++) {
-          if (tud_bt_event_send(pkt->data, pkt->size))
+      DBG_PRINTF("[Q] Pop Type=0x%02X Size=%d\n", pkt->packet_type, pkt->size);
+      bool sent = false;
+
+      // --- BLOCKING SEND STRATEGY ---
+      // We cannot drop packets during connection setup. Retry until USB accepts.
+      while (!sent) {
+        // Emergency Exit: If USB unmounted, drop packet
+        if (!tud_mounted()) {
+            DBG_PRINTF("[USB] Not mounted, drop\n");
             break;
-          tud_task();
-          busy_wait_us(500);
         }
-      } else if (pkt->packet_type == 0x02) { // HCI ACL Data
-        for (int retry = 0; retry < 10; retry++) {
-          if (tud_bt_acl_data_send(pkt->data, pkt->size))
-            break;
-          tud_task();
-          busy_wait_us(500);
+
+        if (pkt->packet_type == 0x04) { // HCI Event
+          uint8_t event_code = pkt->data[0];
+          // Filter BTstack internal events (0x60+)
+          if (event_code >= 0x60 && event_code < 0xFF) {
+             sent = true; // Ignore/Pretend sent
+          } else {
+             if (tud_bt_event_send(pkt->data, pkt->size)) {
+                 DBG_PRINTF("[USB] Event Sent (0x%02X)\n", event_code);
+                 sent = true;
+             }
+          }
+        }
+        else if (pkt->packet_type == 0x02) { // HCI ACL Data
+          if (tud_bt_acl_data_send(pkt->data, pkt->size)) {
+             DBG_PRINTF("[USB] ACL Data Sent\n");
+             sent = true;
+          }
+        }
+
+        if (!sent) {
+           // Run USB task to clear buffers
+           tud_task();
         }
       }
     }
-#endif
 
-    // Periodic status update (disabled to prevent HCI timeouts)
-    // Uncomment for debugging only
-    /*
-    static uint32_t last_status = 0;
-    if (!is_dumping_log && (board_millis() - last_status > 3000)) {
-      last_status = board_millis();
-      cdc_printf("=== STATUS: USB mounted=%d, BT ready=%d ===\n", tud_mounted(),
-                 tud_ready());
-    }
-    */
+    // Removed old periodic status code
   }
 }
 
@@ -137,34 +153,17 @@ void handle_disconnect_event(uint8_t *packet, uint16_t size) {
 }
 
 // UPSTREAM: CYW43 -> Pico -> Host PC
-void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
-  handle_disconnect_event(packet, size);
+void hci_packet_handler(uint8_t packet_type, uint8_t *packet, uint16_t size) {
+  DBG_PRINTF("[CYW] RX Type=0x%02X Size=%d\n", packet_type, size);
 
-  switch (packet_type) {
-  case 0x04: // HCI Event
-  {
-    uint8_t event_code = packet[0];
-
-    // Filter out BTstack internal events (event codes >= 0x60)
-    if (event_code >= 0x60 && event_code < 0xFF) {
-      break; // Silently drop BTstack internal events
-    }
-
-
-    // Enqueue for main loop processing (Thread Safe)
-    if (!hci_packet_queue_enqueue(0x04, packet, size)) {
-    }
-  } break;
-  case 0x02: // HCI ACL Data (CYW43 -> Host)
-  {
-
-    // Enqueue for main loop processing (Thread Safe)
-    if (!hci_packet_queue_enqueue(0x02, packet, size)) {
-    }
-  } break;
-  default:
-    break;
+  // Filter BTstack Internal Events (0x60 - 0x6F)
+  // Since we are now reading raw data, we might see internal chatter.
+  // We filter it so the PC doesn't get confused.
+  if (packet_type == HCI_EVENT_PACKET && packet[0] >= 0x60 && packet[0] <= 0x6F) {
+        return;
   }
+
+  hci_packet_queue_enqueue(packet_type, packet, size);
 }
 
 // DOWNSTREAM: Host PC -> Pico -> CYW43
@@ -186,6 +185,7 @@ void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
 
   uint8_t *cmd = (uint8_t *)hci_cmd;
   uint16_t opcode = cmd[0] | (cmd[1] << 8);
+  DBG_PRINTF("[CMD] Opcode=0x%04X Len=%d\n", opcode, cmd_len);
 
   // Handle HCI Reset (0x0C03) - Reset local state
   if (opcode == 0x0C03) {
@@ -196,20 +196,21 @@ void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
      acl_reassembly_len = 0;
    }
   // Forward all other commands to CYW43
-  hci_transport_cyw43_instance()->send_packet(HCI_COMMAND_DATA_PACKET,
-                                              (uint8_t *)hci_cmd, cmd_len);
+  hci_transport_cyw43_instance()->send_packet(HCI_COMMAND_DATA_PACKET, (uint8_t *)hci_cmd, (int)cmd_len);
 }
 
 void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
   // Preventing buffer overflow
   if (acl_reassembly_len + data_len > sizeof(acl_reassembly_buf)) {
-
-    acl_reassembly_len = 0;
+    DBG_PRINTF("[ACL] Overflow! Resetting.\n");
+    acl_reassembly_len = 0; // Lost sync
   }
 
   // Append new data
   memcpy(&acl_reassembly_buf[acl_reassembly_len], acl_data, data_len);
   acl_reassembly_len += data_len;
+
+  DBG_PRINTF("[ACL] RX Chunk=%d Total=%d\n", data_len, acl_reassembly_len);
 
   // Process Buffer
   while (acl_reassembly_len >= 4) {
@@ -219,6 +220,7 @@ void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
     uint16_t packet_total_len = 4 + data_total_len;
 
     if (acl_reassembly_len >= packet_total_len) {
+      DBG_PRINTF("[ACL] Fwd to CYW43 (Len %d)\n", packet_total_len);
       // We have a complete packet
       hci_transport_cyw43_instance()->send_packet(
           HCI_ACL_DATA_PACKET, acl_reassembly_buf, packet_total_len);
