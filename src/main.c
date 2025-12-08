@@ -34,9 +34,6 @@ enum {
 static volatile int led_state = LED_STATE_IDLE; // Global state
 static bool is_dumping_log = false;
 
-// Debug flag - set to true to enable HCI logging (will cause timeouts!)
-#define HCI_DEBUG 1
-
 // Deferred synthetic HCI response for 0x1004
 static volatile bool pending_0x1004_response = false;
 static volatile uint8_t pending_0x1004_page = 0;
@@ -44,85 +41,6 @@ static volatile uint8_t pending_0x1004_page = 0;
 // CRITICAL: Static buffer for synthetic 0x1004 response
 // Must be static because TinyUSB transmits asynchronously!
 static uint8_t synthetic_response_buffer[16];
-
-// --- CDC Logging ---
-#include "log_buffer.h"
-
-// Output function for log dump to CDC
-void cdc_output(const char *str, int len) {
-  if (tud_cdc_connected()) {
-    int written = 0;
-    while (written < len) {
-      int n = tud_cdc_write(str + written, len - written);
-      if (n > 0) {
-        written += n;
-        tud_cdc_write_flush();
-      } else {
-        break;
-      }
-    }
-  }
-}
-
-int cdc_printf(const char *format, ...) {
-  char buf[256];
-  va_list args;
-  va_start(args, format);
-  int len = vsnprintf(buf, sizeof(buf), format, args);
-  va_end(args);
-
-  if (len > 0) {
-    // Store in log buffer
-    log_buffer_append(buf, len);
-
-    // Strict Whitelist Filter to prevent infinite recursion
-    // We only allow logs that contain specific keywords related to Bluetooth or
-    // Control EP. Everything else (especially CDC logs) is blocked.
-    bool allowed = false;
-
-    // Whitelist Endpoints: 00 (Control), 81 (Event), 02 (ACL Out), 82 (ACL In)
-    if (strstr(buf, "EP 00") || strstr(buf, "EP 0x00") ||
-        strstr(buf, "EP 81") || strstr(buf, "EP 0x81") ||
-        strstr(buf, "EP 02") || strstr(buf, "EP 0x02") ||
-        strstr(buf, "EP 82") || strstr(buf, "EP 0x82")) {
-      allowed = true;
-    }
-
-    // Whitelist Application Logs
-    if (strstr(buf, "HCI") || strstr(buf, "ACL") || strstr(buf, "EV:") ||
-        strstr(buf, "CMD:") || strstr(buf, "Synthetic") ||
-        strstr(buf, "Pico")) {
-      allowed = true;
-    }
-
-    if (!allowed) {
-      return len;
-    }
-
-    // Write to CDC if connected
-    cdc_output(buf, len);
-
-    // ALSO Write to UART (stdout) for debugging via Bridge
-    // simple printf would work since stdout is mapped to UART
-    printf("%s", buf);
-  }
-  return len;
-}
-
-void cdc_task(void) {
-  // Re-enable log dumps for debugging
-  if (tud_cdc_connected() && tud_cdc_available()) {
-    is_dumping_log = true;
-    // Flush all pending input first
-    char buf[64];
-    while (tud_cdc_available()) {
-      tud_cdc_read(buf, sizeof(buf));
-    }
-    // Dump the log buffer once
-    log_buffer_dump(cdc_output);
-    is_dumping_log = false;
-  }
-}
 
 // --- Main Loop ---
 int main() {
@@ -134,10 +52,6 @@ int main() {
   stdio_init_all();
   printf("Pico W Bluetooth Dongle started.\n");
 
-  // Initialize log buffer IMMEDIATELY after stdio
-  // This ensures any early logs (from SDK or elsewhere) don't crash the system
-  log_buffer_init();
-
   if (cyw43_arch_init()) {
     printf("CYW43 init failed\n");
     return -1;
@@ -148,10 +62,9 @@ int main() {
   // Explicit call to btstack_cyw43_init() is not required and causes assertion
   // failure.
 
-  // inform about BTstack state
-  // DISABLED: We don't want duplicate events. Transport patch handles
-  // forwarding. hci_event_callback_registration.callback = &hci_packet_handler;
-  // hci_add_event_handler(&hci_event_callback_registration);
+  hci_event_callback_registration.callback = &hci_packet_handler;
+  hci_add_event_handler(&hci_event_callback_registration);
+  hci_register_acl_packet_handler(&hci_packet_handler);
 
   // turn on bluetooth!
   // DISABLED: We want the HOST (PC) to control the device state.
@@ -170,21 +83,9 @@ int main() {
   // Start main loop
   printf("Entering main loop\n");
 
-  // Wait for CDC connection (up to 5 seconds) to allow catching startup logs
-  uint32_t wait_start = board_millis();
-  while (!tud_cdc_connected() && (board_millis() - wait_start < 5000)) {
-    tud_task(); // Keep USB stack alive
-    sleep_ms(10);
-  }
-
-  cdc_printf("Startup complete. Waiting for host...\n");
-  tud_task();
-  sleep_ms(100);
-
   // Main firmware loop
   while (1) {
     tud_task();
-    cdc_task();
     led_task();
 
 #if 1
@@ -197,9 +98,6 @@ int main() {
         if (event_code >= 0x60 && event_code < 0xFF) {
           continue;
         }
-#if HCI_DEBUG
-        cdc_printf("EV:0x%02x\n", event_code);
-#endif
         for (int retry = 0; retry < 10; retry++) {
           if (tud_bt_event_send(pkt->data, pkt->size))
             break;
@@ -207,9 +105,6 @@ int main() {
           busy_wait_us(500);
         }
       } else if (pkt->packet_type == 0x02) { // HCI ACL Data
-#if HCI_DEBUG
-        cdc_printf("ACL_UP:%d\n", pkt->size);
-#endif
         for (int retry = 0; retry < 10; retry++) {
           if (tud_bt_acl_data_send(pkt->data, pkt->size))
             break;
@@ -233,9 +128,18 @@ int main() {
   }
 }
 
+// Handle disconnect complete event in packet handle
+void handle_disconnect_event(uint8_t *packet, uint16_t size) {
+  if (packet[0] == 0x05 && size >= 4) { // HCI_EVENT_DISCONNECTION_COMPLETE
+    // Reset ACL reassembly buffer for this connection
+    acl_reassembly_len = 0;
+  }
+}
+
 // UPSTREAM: CYW43 -> Pico -> Host PC
-void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
-                        uint16_t size) {
+void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
+  handle_disconnect_event(packet, size);
+
   switch (packet_type) {
   case 0x04: // HCI Event
   {
@@ -246,26 +150,21 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
       break; // Silently drop BTstack internal events
     }
 
-    // cdc_printf("EV:0x%02x\n", event_code);
 
     // Enqueue for main loop processing (Thread Safe)
     if (!hci_packet_queue_enqueue(0x04, packet, size)) {
-      // cdc_printf("[ERR] Queue Full EV:0x%02x\n", event_code);
     }
   } break;
   case 0x02: // HCI ACL Data (CYW43 -> Host)
   {
-    // cdc_printf("ACL_UP:%d\n", size);
 
     // Enqueue for main loop processing (Thread Safe)
     if (!hci_packet_queue_enqueue(0x02, packet, size)) {
-      // cdc_printf("[ERR] Queue Full ACL:%d\n", size);
     }
   } break;
   default:
     break;
   }
-  return;
 }
 
 // DOWNSTREAM: Host PC -> Pico -> CYW43
@@ -276,9 +175,6 @@ void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
 
 // Called by TinyUSB when an HCI event has been successfully transmitted
 void tud_bt_event_sent_cb(uint16_t sent_bytes) {
-#if HCI_DEBUG
-  cdc_printf("[USB] Event sent callback: %d bytes transmitted\n", sent_bytes);
-#endif
 }
 
 // DOWNSTREAM: Host PC -> Pico -> CYW43
@@ -291,25 +187,23 @@ void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
   uint8_t *cmd = (uint8_t *)hci_cmd;
   uint16_t opcode = cmd[0] | (cmd[1] << 8);
 
-#if HCI_DEBUG
-  cdc_printf("CMD:0x%04x\n", opcode);
-#endif
+  // Handle HCI Reset (0x0C03) - Reset local state
+  if (opcode == 0x0C03) {
+     // Clear packet queue to remove stale packets
+     hci_packet_queue_init();
 
+     // Reset ACL reassembly buffer
+     acl_reassembly_len = 0;
+   }
   // Forward all other commands to CYW43
   hci_transport_cyw43_instance()->send_packet(HCI_COMMAND_DATA_PACKET,
                                               (uint8_t *)hci_cmd, cmd_len);
 }
 
 void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
-#if HCI_DEBUG
-  cdc_printf("TUD_BT_ACL_DATA_RECEIVED_CB: total_len=%u\n", data_len);
-#endif
-
   // Preventing buffer overflow
   if (acl_reassembly_len + data_len > sizeof(acl_reassembly_buf)) {
-#if HCI_DEBUG
-    cdc_printf("ACL Reassembly Overflow! Resetting.\n");
-#endif
+
     acl_reassembly_len = 0;
   }
 
@@ -328,10 +222,6 @@ void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
       // We have a complete packet
       hci_transport_cyw43_instance()->send_packet(
           HCI_ACL_DATA_PACKET, acl_reassembly_buf, packet_total_len);
-#if HCI_DEBUG
-      cdc_printf("  -> Forwarded Reassembled ACL (Size: %u)\n",
-                 packet_total_len);
-#endif
 
       // Move remaining data to front
       uint16_t remaining = acl_reassembly_len - packet_total_len;
@@ -355,7 +245,7 @@ void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len) {
 #define USB_PID 0x0013 // A new PID for this project
 #define USB_BCD 0x0200
 
-// --- Device Descriptor ---
+// // --- Device Descriptor ---
 tusb_desc_device_t const desc_device = {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
@@ -404,7 +294,7 @@ enum {
                                   _ep_evt_interval, _ep_in, _ep_out, _ep_size, \
                                   _iso_ep_in, _iso_ep_out, _iso_ep_size)       \
   /* Interface Associate */                                                    \
-  8, TUSB_DESC_INTERFACE_ASSOCIATION, _itfnum, 2,                              \
+  8, TUSB_DESC_INTERFACE_ASSOCIATION, _itfnum, 1,                              \
       TUSB_CLASS_WIRELESS_CONTROLLER, 0x01,                                    \
       TUD_BT_PROTOCOL_PRIMARY_CONTROLLER, 0, /* Interface 0 (ACL) */           \
       9, TUSB_DESC_INTERFACE, _itfnum, 0, 3, TUSB_CLASS_WIRELESS_CONTROLLER,   \
@@ -429,22 +319,23 @@ enum {
       TUSB_XFER_ISOCHRONOUS, U16_TO_U8S_LE(_iso_ep_size), 1
 
 #define CONFIG_TOTAL_LEN                                                       \
-  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_BTH_DESC_LEN)
+  (TUD_CONFIG_DESC_LEN + /*TUD_CDC_DESC_LEN + */ TUD_BTH_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
     // BTH ACL (1) + BTH Voice (1) + CDC (2) = 4 interfaces
-    TUD_CONFIG_DESCRIPTOR(1, 4, 0, CONFIG_TOTAL_LEN, 0x00, 100),
+    TUD_CONFIG_DESCRIPTOR(1, 2, 0, CONFIG_TOTAL_LEN, 0x00, 100),
 
     // BTH Descriptor (Standard with ISO)
     // Using 9 bytes for ISO endpoint size (standard for alt setting 0/1
     // variants in some configs)
     TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, 0, EPNUM_BT_EVT, 64, 0x01, EPNUM_BT_ACL_IN,
                        EPNUM_BT_ACL_OUT, 64, EPNUM_BT_ISO_IN, EPNUM_BT_ISO_OUT,
-                       9),
+                       9)
 
     // CDC Descriptor
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT,
-                       EPNUM_CDC_IN, 64)};
+    // TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT,
+    //                    EPNUM_CDC_IN, 64)
+    };
 
 char const *string_desc_arr[] = {
     (char[]){0x09, 0x04}, "Raspberry Pi", "Pico W BT Dongle", "123456",

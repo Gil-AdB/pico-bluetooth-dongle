@@ -24,21 +24,19 @@ extern "C" {
 //--------------------------------------------------------------------
 // Enable the Bluetooth Host Controller Interface (BTH) class driver
 // Enable full debug logging for TinyUSB
-#ifdef CFG_TUSB_DEBUG
-#undef CFG_TUSB_DEBUG
-#endif
-#define CFG_TUSB_DEBUG 2
+// #ifdef CFG_TUSB_DEBUG
+// #undef CFG_TUSB_DEBUG
+// #endif
+// #define CFG_TUSB_DEBUG 2
 
 // Redirect TinyUSB debug output to our custom CDC printf
-#define CFG_TUSB_DEBUG_PRINTF cdc_printf
-int cdc_printf(const char *format, ...);
 #define CFG_TUD_BTH                                                            \
   1 // Set Isochronous (audio) endpoint support to 1, as Windows expects it.
 #define CFG_TUD_BTH_ISO_ALT_COUNT 2
 
-#define CFG_TUD_CDC 1
-#define CFG_TUD_CDC_RX_BUFSIZE 512
-#define CFG_TUD_CDC_TX_BUFSIZE 512
+// #define CFG_TUD_CDC 1
+// #define CFG_TUD_CDC_RX_BUFSIZE 512
+// #define CFG_TUD_CDC_TX_BUFSIZE 512
 
 #ifdef __cplusplus
 }
