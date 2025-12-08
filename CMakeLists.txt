@@ -14,7 +14,6 @@ set(CMAKE_CXX_STANDARD 17)
 # 3. Set the target board.
 set(PICO_BOARD pico2_w)
 
-
 #set(PICO_CYW43_ARCH_HEADER pico/cyw43_arch/arch_threaded.h)
 
 # 4. Now, initialize the Pico SDK.
@@ -25,6 +24,8 @@ add_executable(${PROJECT_NAME}
 		src/main.c
 		${PICO_SDK_PATH}/lib/tinyusb/src/class/bth/bth_device.c
 )
+
+pico_set_binary_type(${PROJECT_NAME} copy_to_ram)
 
 # 6. Enable the CYW43 wireless driver support.
 #pico_enable_cyw43_arch_default()
@@ -48,6 +49,7 @@ target_sources(${PROJECT_NAME} PRIVATE
 # 7. Link all necessary libraries to your executable.
 target_link_libraries(${PROJECT_NAME}
 		pico_stdlib
+		pico_multicore
 		pico_async_context_base
 		pico_async_context_poll
 		pico_async_context_threadsafe_background

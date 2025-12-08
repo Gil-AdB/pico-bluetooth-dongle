@@ -2,18 +2,14 @@
 #include "bsp/board.h"
 #include "bth_device.h"
 #include "btstack.h"
-#include "btstack_memory.h"
-#include "hci.h"
-#include "pico/btstack_cyw43.h"
 #include "pico/btstack_hci_transport_cyw43.h"
-// #include "pico/btstack_run_loop_async_context.h" // Removed: File not found
-// and unused
 #include "hci_packet_queue.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 #include "tusb.h"
-#include <stdarg.h>
 #include <string.h>
+#include "hardware/irq.h" // Needed for priority settings
+#include "hardware/clocks.h"
 
 // --- DEBUGGING ---
 // Uncomment to enable verbose serial logs
@@ -34,15 +30,6 @@ static btstack_packet_callback_registration_t hci_event_callback_registration;
 void hci_packet_handler(uint8_t packet_type, uint8_t *packet, uint16_t size);
 void led_task(void);
 
-// --- LED Status ---
-enum {
-  LED_STATE_IDLE,     // Blink (1Hz, 700ms ON / 300ms OFF)
-  LED_STATE_MOUNTED,  // Fast Blink (5Hz)
-  LED_STATE_SUSPENDED // Pulse (Short blink every 2s)
-};
-static volatile int led_state = LED_STATE_IDLE; // Global state
-static bool is_dumping_log = false;
-
 // Deferred synthetic HCI response for 0x1004
 static volatile bool pending_0x1004_response = false;
 static volatile uint8_t pending_0x1004_page = 0;
@@ -51,11 +38,65 @@ static volatile uint8_t pending_0x1004_page = 0;
 // Must be static because TinyUSB transmits asynchronously!
 static uint8_t synthetic_response_buffer[16];
 
+#include "pico/multicore.h"
+
+// Core 1 Main Loop: Dedicated to USB Pumping
+void __not_in_flash_func(core1_entry)(void) {
+    printf("Core 1 running: Handling USB\n");
+
+    while (1) {
+      tud_task(); // Keep USB happy
+      // 1. CLAIM: Inspect the packet at the front of the queue
+      hci_packet_entry_t *pkt = hci_packet_queue_get_front();
+
+      if (pkt != NULL) {
+        bool sent = false;
+
+        // 2. PROCESS: Retry loop until USB accepts data
+        while (!sent) {
+          // Safety: Discard if USB unplugged to avoid infinite freeze
+          if (!tud_mounted()) {
+            sent = true;
+            break;
+          }
+
+          if (pkt->packet_type == HCI_ACL_DATA_PACKET) {
+            // Returns true if buffer copied to USB hardware FIFO
+            if (tud_bt_acl_data_send(pkt->data, pkt->size)) {
+              sent = true;
+            }
+          }
+          else if (pkt->packet_type == HCI_EVENT_PACKET) {
+            // Filter internal events here if needed
+            if ((pkt->data[0] >= 0x60 && pkt->data[0] <= 0x6F) ||
+                tud_bt_event_send(pkt->data, pkt->size)) {
+              sent = true;
+            }
+          }
+
+          // Important: If not sent, we Loop.
+          // We do NOT call free_front(). The buffer remains locked.
+          // Queue tail does NOT move. Producer cannot overwrite.
+          if (!sent) {
+            tud_task(); // Handle USB events to clear buffer
+          }
+        }
+
+        // 3. RELEASE: Packet sent (or dropped). Now free the slot.
+        hci_packet_queue_free_front();
+      }
+    }
+}
+
 // --- Main Loop ---
 int main() {
   // Initialize HCI packet queue FIRST - before ANY other init!
   // This must happen before cyw43_arch_init() which can trigger BT activity
   hci_packet_queue_init();
+
+  // 1. Init System & Queue
+  set_sys_clock_khz(240000, true); // OPTIONAL: Overclock to 200MHz
+  board_init();
 
   board_init();
   stdio_init_all();
@@ -66,18 +107,13 @@ int main() {
     return -1;
   }
 
-  // Initialise BTstack
-  // Note: cyw43_arch_init() handles BTstack initialization on Pico 2 W.
-  // Explicit call to btstack_cyw43_init() is not required and causes assertion
-  // failure.
-
-  // hci_event_callback_registration.callback = &hci_packet_handler;
-  // hci_add_event_handler(&hci_event_callback_registration);
-  // hci_register_acl_packet_handler(&hci_packet_handler);
-
-  // turn on bluetooth!
-  // DISABLED: We want the HOST (PC) to control the device state.
-  // hci_power_control(HCI_POWER_ON);
+  // --- FIX 2: BOOST IRQ PRIORITY ---
+  // The CYW43 driver uses DMA/PIO interrupts. We must ensure they are
+  // higher priority than anything else (default is 0x80, lower is better).
+  // This prevents Core 0 from stalling processing the WiFi/BT chip.
+  irq_set_priority(DMA_IRQ_0, 0x40);
+  irq_set_priority(DMA_IRQ_1, 0x40);
+  irq_set_priority(PIO1_IRQ_0, 0x40); // CYW43 usually on PIO1
 
   // Antigravity Fix: Manually open transport to wake up chip, but don't start
   // BTstack logic.
@@ -89,58 +125,20 @@ int main() {
   // Initialize TinyUSB
   tusb_init();
 
+  // 5. Launch USB handling on Core 1
+  multicore_launch_core1(core1_entry);
+
   // Start main loop
   printf("Entering main loop\n");
 
-  // Main firmware loop
+  // 6. Core 0 Main Loop: Just handles background tasks (LEDs, Wi-Fi/BT IRQs)
+  // Note: tud_task() is moved to Core 1. Do NOT call it here.
   while (1) {
-    tud_task();
     led_task();
 
-    // Process HCI packet queue (forward CYW43 packets to USB)
-    hci_packet_entry_t *pkt;
-
-    // Dequeue packets (Thread Safe Access assumed per new queue implementation)
-    while ((pkt = hci_packet_queue_dequeue()) != NULL) {
-      DBG_PRINTF("[Q] Pop Type=0x%02X Size=%d\n", pkt->packet_type, pkt->size);
-      bool sent = false;
-
-      // --- BLOCKING SEND STRATEGY ---
-      // We cannot drop packets during connection setup. Retry until USB accepts.
-      while (!sent) {
-        // Emergency Exit: If USB unmounted, drop packet
-        if (!tud_mounted()) {
-            DBG_PRINTF("[USB] Not mounted, drop\n");
-            break;
-        }
-
-        if (pkt->packet_type == 0x04) { // HCI Event
-          uint8_t event_code = pkt->data[0];
-          // Filter BTstack internal events (0x60+)
-          if (event_code >= 0x60 && event_code < 0xFF) {
-             sent = true; // Ignore/Pretend sent
-          } else {
-             if (tud_bt_event_send(pkt->data, pkt->size)) {
-                 DBG_PRINTF("[USB] Event Sent (0x%02X)\n", event_code);
-                 sent = true;
-             }
-          }
-        }
-        else if (pkt->packet_type == 0x02) { // HCI ACL Data
-          if (tud_bt_acl_data_send(pkt->data, pkt->size)) {
-             DBG_PRINTF("[USB] ACL Data Sent\n");
-             sent = true;
-          }
-        }
-
-        if (!sent) {
-           // Run USB task to clear buffers
-           tud_task();
-        }
-      }
-    }
-
-    // Removed old periodic status code
+    // Use WFE (Wait For Event) to save power on Core 0
+    // The CYW43 driver is interrupt-driven, so it will wake up Core 0 automatically.
+    __wfe();
   }
 }
 
@@ -153,7 +151,7 @@ void handle_disconnect_event(uint8_t *packet, uint16_t size) {
 }
 
 // UPSTREAM: CYW43 -> Pico -> Host PC
-void hci_packet_handler(uint8_t packet_type, uint8_t *packet, uint16_t size) {
+void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint8_t *packet, uint16_t size) {
   DBG_PRINTF("[CYW] RX Type=0x%02X Size=%d\n", packet_type, size);
 
   // Filter BTstack Internal Events (0x60 - 0x6F)
@@ -161,6 +159,22 @@ void hci_packet_handler(uint8_t packet_type, uint8_t *packet, uint16_t size) {
   // We filter it so the PC doesn't get confused.
   if (packet_type == HCI_EVENT_PACKET && packet[0] >= 0x60 && packet[0] <= 0x6F) {
         return;
+  }
+
+  // 2. LOAD SHEDDING: Drop LE Advertising Reports if busy
+  // HCI_LE_Meta_Event (0x3E) -> Subevent 0x02 (Advertising Report)
+  // These packets are spammed by nearby devices.
+  if (packet_type == HCI_EVENT_PACKET && packet[0] == 0x3E) {
+    // Check Subevent Code (Byte 2 of packet)
+    // Packet: [EventCode 0x3E] [Len] [SubEventCode] ...
+    if (size > 2 && packet[2] == 0x02) {
+      uint8_t load = hci_packet_queue_count();
+      // If queue is > 25% full, start dropping Scan Results
+      // This prioritizes Audio (ACL Data) over Scanning
+      if (load > (HCI_PACKET_QUEUE_SIZE / 4)) {
+        return; // Drop!
+      }
+    }
   }
 
   hci_packet_queue_enqueue(packet_type, packet, size);
@@ -382,73 +396,54 @@ uint8_t const desc_bos[] = {
 
 uint8_t const *tud_descriptor_bos_cb(void) { return desc_bos; }
 
-void led_task(void) {
-  static uint32_t start_ms = 0;
-  static bool led_on = false;
-  uint32_t interval = 500;
 
-  switch (led_state) {
-  case LED_STATE_IDLE:
-    // Asymmetric blink: 900ms ON, 100ms OFF
-    if (led_on) {
-      if (board_millis() - start_ms > 900) {
-        start_ms += 900;
-        led_on = false;
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-      }
-    } else {
-      if (board_millis() - start_ms > 100) {
-        start_ms += 100;
-        led_on = true;
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-      }
-    }
-    break;
-  case LED_STATE_MOUNTED:
-    interval = 100; // 5Hz (100ms on, 100ms off)
-    if (board_millis() - start_ms > interval) {
-      start_ms += interval;
-      led_on = !led_on;
-      cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
-    }
-    break;
-  case LED_STATE_SUSPENDED:
-    // Pulse: ON for 100ms, OFF for 1900ms
-    if (led_on) {
-      if (board_millis() - start_ms > 100) {
-        start_ms += 100;
-        led_on = false;
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-      }
-    } else {
-      if (board_millis() - start_ms > 1900) {
-        start_ms += 1900;
-        led_on = true;
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-      }
-    }
-    break;
+// --- LED Task with "Sticky" Error ---
+void led_task(void) {
+  static uint32_t led_interval_ms = 1000;
+  static bool led_state = false;
+  static uint32_t last_toggle = 0;
+  static uint32_t error_latch_ms = 0; // How long to stay red
+
+  // Check for actual drops (Queue Full events)
+  if (hci_packet_queue_get_drops() > 0) {
+    error_latch_ms = 1000; // Flash fast for 1 second if we drop anything
+  }
+
+  // Determine interval
+  uint32_t interval = 1000;
+
+  if (error_latch_ms > 0) {
+    // High Priority Blink (We are dropping packets!)
+    interval = 50;
+    error_latch_ms = (error_latch_ms > 50) ? (error_latch_ms - 50) : 0;
+  } else {
+    // Normal Load Monitor
+    uint8_t count = hci_packet_queue_count();
+    if (count > 0) interval = 200; // Data flowing
+    if (count > 30) interval = 100; // Heavy load
+  }
+
+  if (board_millis() - last_toggle > interval) {
+    last_toggle = board_millis();
+    led_state = !led_state;
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
   }
 }
 
 // --- USB Callbacks ---
 void tud_mount_cb(void) {
   printf("USB MOUNTED\n");
-  led_state = LED_STATE_MOUNTED;
 }
 
 void tud_umount_cb(void) {
   printf("USB UNMOUNTED\n");
-  led_state = LED_STATE_IDLE;
 }
 
 void tud_suspend_cb(bool remote_wakeup_en) {
   (void)remote_wakeup_en;
   printf("USB SUSPENDED\n");
-  led_state = LED_STATE_SUSPENDED;
 }
 
 void tud_resume_cb(void) {
   printf("USB RESUMED\n");
-  led_state = LED_STATE_MOUNTED;
 }
