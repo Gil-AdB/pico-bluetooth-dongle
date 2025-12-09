@@ -2,15 +2,15 @@
 #include "bsp/board.h"
 #include "bth_device.h"
 #include "btstack.h"
-#include "pico/btstack_hci_transport_cyw43.h"
+#include "hardware/clocks.h"
+#include "hardware/irq.h"   // Needed for priority settings
+#include "hardware/timer.h" // For time_us_64()
 #include "hci_packet_queue.h"
+#include "pico/btstack_hci_transport_cyw43.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 #include "tusb.h"
 #include <string.h>
-#include "hardware/irq.h" // Needed for priority settings
-#include "hardware/clocks.h"
-#include "hardware/timer.h" // For time_us_64()
 
 // --- PROFILING VARIABLES ---
 static volatile uint32_t prof_c0_loops = 0;
@@ -24,9 +24,9 @@ static volatile uint32_t prof_spi_last_us = 0;
 // #define DEBUG_LOGS
 
 #ifdef DEBUG_LOGS
-  #define DBG_PRINTF(...) printf(__VA_ARGS__)
+#define DBG_PRINTF(...) printf(__VA_ARGS__)
 #else
-  #define DBG_PRINTF(...)
+#define DBG_PRINTF(...)
 #endif
 
 // Buffer for assembling fragmented ACL packets from USB
@@ -58,13 +58,19 @@ void __not_in_flash_func(core1_entry)(void) {
     if (rx_pkt) {
       bool sent = false;
       while (!sent) {
-        if (!tud_mounted()) { sent = true; break; }
-        if (rx_pkt->packet_type == HCI_ACL_DATA_PACKET) {
-          if (tud_bt_acl_data_send(rx_pkt->data, rx_pkt->size)) sent = true;
-        } else if (rx_pkt->packet_type == HCI_EVENT_PACKET) {
-          if (tud_bt_event_send(rx_pkt->data, rx_pkt->size)) sent = true;
+        if (!tud_mounted()) {
+          sent = true;
+          break;
         }
-        if (!sent) tud_task();
+        if (rx_pkt->packet_type == HCI_ACL_DATA_PACKET) {
+          if (tud_bt_acl_data_send(rx_pkt->data, rx_pkt->size))
+            sent = true;
+        } else if (rx_pkt->packet_type == HCI_EVENT_PACKET) {
+          if (tud_bt_event_send(rx_pkt->data, rx_pkt->size))
+            sent = true;
+        }
+        if (!sent)
+          tud_task();
       }
       hci_rx_free();
     }
@@ -99,7 +105,8 @@ int main() {
   // The CYW43 chip puts the radio to sleep aggressively.
   // This causes Bluetooth Audio packets to be delayed/bunched up.
   // We force "Performance Mode" to keep the radio active.
-  // cyw43_wifi_pm(&cyw43_state, cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 20, 1, 1, 1));
+  // cyw43_wifi_pm(&cyw43_state, cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 20, 1,
+  // 1, 1));
 
   // --- FIX 2: BOOST IRQ PRIORITY ---
   // The CYW43 driver uses DMA/PIO interrupts. We must ensure they are
@@ -139,12 +146,14 @@ int main() {
       // MEASURE SPI TIME
       uint64_t start = time_us_64();
       // Try to send to chip
-      int result = transport->send_packet(tx_pkt->packet_type, tx_pkt->data, tx_pkt->size);
+      int result = transport->send_packet(tx_pkt->packet_type, tx_pkt->data,
+                                          tx_pkt->size);
       uint32_t dur = (uint32_t)(time_us_64() - start);
 
       // Update stats
       prof_spi_last_us = dur;
-      if (dur > prof_spi_max_us) prof_spi_max_us = dur;
+      if (dur > prof_spi_max_us)
+        prof_spi_max_us = dur;
 
       if (result == 0) {
         // SUCCESS: Driver accepted the packet
@@ -175,14 +184,16 @@ void handle_disconnect_event(uint8_t *packet, uint16_t size) {
 }
 
 // UPSTREAM: CYW43 -> Pico -> Host PC
-void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint8_t *packet, uint16_t size) {
+void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type,
+                                             uint8_t *packet, uint16_t size) {
   DBG_PRINTF("[CYW] RX Type=0x%02X Size=%d\n", packet_type, size);
 
   // Filter BTstack Internal Events (0x60 - 0x6F)
   // Since we are now reading raw data, we might see internal chatter.
   // We filter it so the PC doesn't get confused.
-  if (packet_type == HCI_EVENT_PACKET && packet[0] >= 0x60 && packet[0] <= 0x6F) {
-        return;
+  if (packet_type == HCI_EVENT_PACKET && packet[0] >= 0x60 &&
+      packet[0] <= 0x6F) {
+    return;
   }
 
   // // 2. LOAD SHEDDING: Drop LE Advertising Reports if busy
@@ -202,12 +213,11 @@ void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint8_t *packe
   // }
 
   // --- IRQ HANDLER (Chip -> RX Queue) ---
-    hci_rx_enqueue(packet_type, packet, size);
+  hci_rx_enqueue(packet_type, packet, size);
 }
 
 // Called by TinyUSB when an HCI event has been successfully transmitted
-void tud_bt_event_sent_cb(uint16_t sent_bytes) {
-}
+void tud_bt_event_sent_cb(uint16_t sent_bytes) {}
 
 // DOWNSTREAM: Host PC -> Pico -> CYW43
 void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
@@ -222,8 +232,8 @@ void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len) {
 
   // Handle HCI Reset (0x0C03) - Reset local state
   if (opcode == 0x0C03) {
-     // Reset ACL reassembly buffer
-     acl_reassembly_len = 0;
+    // Reset ACL reassembly buffer
+    acl_reassembly_len = 0;
   }
 
   hci_tx_enqueue(HCI_COMMAND_DATA_PACKET, (uint8_t *)hci_cmd, cmd_len);
@@ -367,7 +377,7 @@ uint8_t const desc_configuration[] = {
     // CDC Descriptor
     // TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT,
     //                    EPNUM_CDC_IN, 64)
-    };
+};
 
 char const *string_desc_arr[] = {
     (char[]){0x09, 0x04}, "Raspberry Pi", "Pico W BT Dongle", "123456",
@@ -438,16 +448,18 @@ void stats_task(void) {
 
     // 1. Throughput
     printf("THROUGHPUT : RX=%.2f KB/s (%lu pkts)  TX=%.2f KB/s (%lu pkts)\n",
-                   rx_kbps, (unsigned long)s.rx.total,
-                   tx_kbps, (unsigned long)s.tx.total);
+           rx_kbps, (unsigned long)s.rx.total, tx_kbps,
+           (unsigned long)s.tx.total);
     // 2. Queue Health
     printf("QUEUES   : RX_Peak=%lu  TX_Peak=%lu  Drops=%lu\n",
            (unsigned long)s.rx.peak_depth, (unsigned long)s.tx.peak_depth,
            (unsigned long)(s.rx.drops + s.tx.drops));
+    printf("TX BUSY  : %lu (CYW43 buffer full retries)\n",
+           (unsigned long)s.tx.driver_busy);
 
     // 3. CPU Health (The new stuff)
-    // A healthy Pico running at 240MHz should loop > 1,000,000 times/sec if idle.
-    // If this is < 10,000, something is blocking HARD.
+    // A healthy Pico running at 240MHz should loop > 1,000,000 times/sec if
+    // idle. If this is < 10,000, something is blocking HARD.
     printf("CPU LOOP : Core0=%lu k/s  Core1=%lu k/s\n",
            (unsigned long)(prof_c0_loops / 10000),
            (unsigned long)(prof_c1_loops / 10000));
@@ -457,7 +469,8 @@ void stats_task(void) {
            (unsigned long)prof_spi_max_us, (unsigned long)prof_spi_last_us);
 
     // 5. Data Integrity
-    printf("USB ERR  : Reassembly Resets=%lu\n", (unsigned long)prof_reassembly_err);
+    printf("USB ERR  : Reassembly Resets=%lu\n",
+           (unsigned long)prof_reassembly_err);
 
     printf("===========================\n");
 
@@ -469,19 +482,13 @@ void stats_task(void) {
 }
 
 // --- USB Callbacks ---
-void tud_mount_cb(void) {
-  printf("USB MOUNTED\n");
-}
+void tud_mount_cb(void) { printf("USB MOUNTED\n"); }
 
-void tud_umount_cb(void) {
-  printf("USB UNMOUNTED\n");
-}
+void tud_umount_cb(void) { printf("USB UNMOUNTED\n"); }
 
 void tud_suspend_cb(bool remote_wakeup_en) {
   (void)remote_wakeup_en;
   printf("USB SUSPENDED\n");
 }
 
-void tud_resume_cb(void) {
-  printf("USB RESUMED\n");
-}
+void tud_resume_cb(void) { printf("USB RESUMED\n"); }
