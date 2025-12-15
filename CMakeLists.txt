@@ -43,7 +43,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_include_directories(${PROJECT_NAME} PRIVATE .)
 target_sources(${PROJECT_NAME} PRIVATE
   src/main.c
-  src/log_buffer.c
+  src/bt_hci.c
+  src/usb_descriptors.c
+  src/stats.c
   src/hci_packet_queue.c
 )
 # 7. Link all necessary libraries to your executable.
