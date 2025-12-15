@@ -1,41 +1,55 @@
 # Pico W Bluetooth Dongle
 
-This project aims to create a USB Bluetooth HCI dongle using the Raspberry Pi Pico W.
-It utilizes the Pico SDK, TinyUSB, and BTstack to provide Bluetooth functionality
-and a CDC (serial) interface for debugging.
+A USB Bluetooth HCI dongle using the Raspberry Pi Pico W (RP2350).
+
+## Features
+
+- USB Bluetooth HCI transport (works with Linux BlueZ)
+- A2DP audio streaming support
+- SCO/HFP voice support (isochronous endpoints)
+- Dynamic LED indicator (blink rate = traffic level)
 
 ## Build Instructions
 
-1.  **Initialize Submodules:**
-    ```bash
-    git submodule update --init --recursive
-    ```
+```bash
+# Clone with submodules
+git clone --recursive https://github.com/Gil-AdB/pico-bluetooth-dongle.git
+cd pico-bluetooth-dongle
 
-2.  **Build the Project:**
-    ```bash
-    mkdir build
-    cd build
-    cmake ..
-    make -j8
-    ```
-    This will generate `pico_bluetooth_dongle.uf2` in the `build` directory.
+# Build
+mkdir build && cd build
+cmake -G Ninja -DPICO_BOARD=pico2_w ..
+ninja -j8
+```
 
-## Flashing the Firmware
+Output: `build/pico_bluetooth_dongle.uf2`
 
-1.  Disconnect your Pico W from the computer.
-2.  Press and hold the `BOOTSEL` button, then connect the Pico W to your computer via USB. It should appear as a mass storage device named `RPI-RP2`.
-3.  Drag and drop the `pico_bluetooth_dongle.uf2` file onto the `RPI-RP2` drive. The Pico W will reboot automatically.
+## Flashing
 
-## Current Status
+1. Hold `BOOTSEL` button and connect Pico W via USB
+2. Copy `pico_bluetooth_dongle.uf2` to the `RPI-RP2` drive
+3. Pico W reboots automatically
 
-The project now compiles successfully and is configured as a composite USB device, exposing both a Bluetooth HCI interface and a CDC (serial) interface for debugging.
+## Usage on Linux
 
-**Known Issue:**
-On Windows, the device currently enumerates as a Bluetooth dongle but fails to start with "Code 10: An invalid parameter was passed to a service or function". The intended CDC (serial) port for `printf` output does not appear.
+```bash
+# Check if dongle is detected
+hciconfig
 
-## Debugging
+# Scan and pair devices
+bluetoothctl
+> power on
+> scan on
+> pair XX:XX:XX:XX:XX:XX
+> connect XX:XX:XX:XX:XX:XX
+```
 
-*   **Serial Output (intended):** If the CDC serial port appears (e.g., in Windows Device Manager under "Ports (COM & LPT)"), you can connect to it with a serial terminal (115200 baud) to view `printf` messages.
-*   **External Debugging:** If the CDC serial port remains unavailable, external debugging methods are recommended:
-    *   **Logic Analyzer:** To capture and analyze USB traffic at a low level.
-    *   **TTL Adapter:** To get serial output directly from the Pico W's UART pins (refer to Pico W documentation for UART pinout and configuration).
+## Serial Debugging
+
+UART output on GPIO 0/1 (115200 baud). Use a TTL adapter to view logs.
+
+## Architecture
+
+- **Core 0**: CYW43 Bluetooth + statistics
+- **Core 1**: TinyUSB device stack
+- **Dual queues**: RX (chip→host) and TX (host→chip)
