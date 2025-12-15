@@ -50,4 +50,7 @@ void hci_packet_queue_get_stats_and_reset(queue_stats_t *stats_out);
 
 void hci_tx_signal_busy(void);
 
+// Get current TX bytes (for LED activity)
+uint32_t hci_tx_get_bytes(void);
+
 #endif

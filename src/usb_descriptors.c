@@ -21,6 +21,8 @@ tusb_desc_device_t const desc_device = {
     .bNumConfigurations = 0x01};
 
 // --- Configuration Descriptor ---
+// Note: CONFIG_TOTAL_LEN includes 4 ISO alternate settings
+// (CFG_TUD_BTH_ISO_ALT_COUNT)
 #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_BTH_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
@@ -28,10 +30,14 @@ uint8_t const desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
 
     // BTH Descriptor with isochronous endpoints for SCO
+    // Alt 0: 0 (silent/no endpoints) - implied by TinyUSB
+    // Alt 1: 9 bytes (CVSD 8kHz basic)
+    // Alt 2: 17 bytes (CVSD enhanced)
+    // Alt 3: 33 bytes (mSBC 16kHz wideband)
     TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, 0, EPNUM_BT_EVT, 64, 0x01, // Event endpoint
                        EPNUM_BT_ACL_IN, EPNUM_BT_ACL_OUT, 64,  // ACL endpoints
-                       EPNUM_BT_ISO_IN, EPNUM_BT_ISO_OUT,
-                       9) // ISO endpoints (Alt 1)
+                       EPNUM_BT_ISO_IN, EPNUM_BT_ISO_OUT,      // ISO endpoints
+                       9, 17, 33) // ISO packet sizes for alt 1, 2, 3
 };
 
 // --- String Descriptors ---

@@ -1,5 +1,6 @@
 // bt_hci.c - HCI packet handling for Pico W Bluetooth Dongle
 #include "bt_hci.h"
+#include "bt_sco.h"
 #include "btstack.h"
 #include "hci_packet_queue.h"
 #include "pico.h"
@@ -12,6 +13,9 @@
 #else
 #define DBG_PRINTF(...) ((void)0)
 #endif
+
+// HCI packet types
+#define HCI_SCO_DATA_PACKET 0x03
 
 // --- ACL Reassembly ---
 static uint8_t acl_reassembly_buf[2048];
@@ -32,6 +36,12 @@ void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type,
   // Filter BTstack Internal Events (0x60 - 0x6F)
   if (packet_type == HCI_EVENT_PACKET && packet[0] >= 0x60 &&
       packet[0] <= 0x6F) {
+    return;
+  }
+
+  // SCO packets → SCO handler (voice data)
+  if (packet_type == HCI_SCO_DATA_PACKET) {
+    bt_sco_rx_packet(packet, size);
     return;
   }
 

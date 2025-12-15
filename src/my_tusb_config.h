@@ -9,10 +9,9 @@ extern "C" {
 #define CFG_TUSB_RHPORT0_MODE OPT_MODE_DEVICE
 
 // DISABLE DEBUGGING to stop UART spam and timing violations
-#ifdef CFG_TUSB_DEBUG
-#undef CFG_TUSB_DEBUG
-#endif
+#ifndef CFG_TUSB_DEBUG
 #define CFG_TUSB_DEBUG 0
+#endif
 
 // --- Class configuration ---
 
@@ -28,6 +27,8 @@ extern "C" {
 #define CFG_TUD_BTH_TX_BUFSIZE 2048
 // Event/Cmd Max Size: 256 bytes
 #define CFG_TUD_BTH_EVENT_BUFSIZE 256
+// SCO: 4 alternate settings (0=silent, 1=9B, 2=17B, 3=33B)
+#define CFG_TUD_BTH_ISO_ALT_COUNT 4
 
 #ifdef __cplusplus
 }

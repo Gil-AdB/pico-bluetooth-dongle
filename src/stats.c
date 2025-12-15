@@ -57,19 +57,21 @@ void stats_record_tx_send(void) {
 void stats_task(void) {
   static uint32_t last_stats = 0;
   static uint32_t last_led = 0;
-  static uint32_t led_tx_snapshot = 0;
+  static uint32_t led_bytes_snapshot = 0;
   uint32_t now = board_millis();
 
   // --- LED Activity Indicator ---
-  // Blink rate based on TX traffic: 1Hz idle, 2Hz low, 5Hz medium, 10Hz high
-  // Uses tx_gap_count which is incremented by stats_record_tx_send()
-  uint32_t tx_since_last = tx_gap_count - led_tx_snapshot;
+  // Blink rate based on TX bytes: 1Hz idle, 2Hz low, 5Hz medium, 10Hz high
+  // Uses hci_tx_get_bytes() which tracks actual bytes transferred
+  uint32_t tx_bytes = hci_tx_get_bytes();
+  uint32_t bytes_since_last = tx_bytes - led_bytes_snapshot;
   uint32_t led_interval;
-  if (tx_since_last > 50)
-    led_interval = 50; // 10Hz - audio streaming
-  else if (tx_since_last > 20)
+  // Thresholds for bytes in ~50-500ms window
+  if (bytes_since_last > 2000)
+    led_interval = 50; // 10Hz - audio streaming (~40KB/s)
+  else if (bytes_since_last > 500)
     led_interval = 100; // 5Hz - medium traffic
-  else if (tx_since_last > 5)
+  else if (bytes_since_last > 100)
     led_interval = 250; // 2Hz - low traffic
   else
     led_interval = 500; // 1Hz - idle
@@ -78,7 +80,7 @@ void stats_task(void) {
     last_led = now;
     led_state = !led_state;
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
-    led_tx_snapshot = tx_gap_count; // Snapshot for next interval
+    led_bytes_snapshot = tx_bytes; // Snapshot for next interval
   }
 
   // --- Stats Printing (every 10s) ---

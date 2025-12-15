@@ -44,6 +44,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE .)
 target_sources(${PROJECT_NAME} PRIVATE
   src/main.c
   src/bt_hci.c
+  src/bt_sco.c
   src/usb_descriptors.c
   src/stats.c
   src/hci_packet_queue.c
@@ -72,7 +73,6 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 		PICO_STDIO_USB=0
 		PICO_STDIO_UART=1
 		CFG_TUD_BTH=1
-		CFG_TUSB_DEBUG=0
 )
 
 # Enable RTT for SWD logging
