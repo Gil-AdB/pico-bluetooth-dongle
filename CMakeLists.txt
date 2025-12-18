@@ -1,6 +1,10 @@
 # CMakeLists.txt
 cmake_minimum_required(VERSION 3.13)
 
+if(NOT PICO_BOARD)
+	set(PICO_BOARD pico2_w)
+endif()
+
 # 1. First, include the SDK to make its functions available.
 set(PICO_SDK_PATH ${CMAKE_CURRENT_SOURCE_DIR}/pico-sdk)
 
@@ -11,8 +15,6 @@ project(pico_bluetooth_dongle C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-# 3. Set the target board.
-set(PICO_BOARD pico2_w)
 
 #set(PICO_CYW43_ARCH_HEADER pico/cyw43_arch/arch_threaded.h)
 
@@ -25,7 +27,10 @@ add_executable(${PROJECT_NAME}
 		${PICO_SDK_PATH}/lib/tinyusb/src/class/bth/bth_device.c
 )
 
-pico_set_binary_type(${PROJECT_NAME} copy_to_ram)
+if(PICO_BOARD STREQUAL "pico2_w")
+	message(STATUS "copy_to_ram")
+	pico_set_binary_type(${PROJECT_NAME} copy_to_ram)
+endif()
 
 # 6. Enable the CYW43 wireless driver support.
 #pico_enable_cyw43_arch_default()
